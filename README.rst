@@ -13,6 +13,8 @@ Build
    meson test -C build
 
 The required development dependencies are LuaJIT, yyjson, xxHash and libsystemd.
+PipeWire development headers are optional and enable the event-driven default
+sink volume module.
 
 Configuration
 -------------
@@ -41,15 +43,21 @@ The high-level Lua modules can be loaded explicitly:
 
    local clock = require("i3sd.modules.clock")
    local memory = require("i3sd.modules.memory")
+   local pipewire_volume = require("i3sd.modules.pipewire_volume")
    local power_profiles = require("i3sd.modules.power_profiles")
    local systemd = require("i3sd.modules.systemd")
 
    clock { format = "%H:%M" }
    memory { warn_below = 20, critical_below = 10 }
+   pipewire_volume {}
    power_profiles {}
    systemd { scope = "both" }
 
 Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for the complete architecture, API contracts and delivery roadmap.
+
+``pipewire_volume`` follows the current default audio sink and updates without
+polling. It displays one of ``▏ ▎ ▍ ▌ ▋ ▊ ▉ █`` for the volume, ``🔇`` while
+muted, and remains hidden while PipeWire or a default sink is unavailable.
 
 Lua modules can start one bounded asynchronous child process from a block
 callback. ``ctx:spawn`` returns ``nil`` during staging, when another child is

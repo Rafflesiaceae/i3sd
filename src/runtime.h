@@ -31,12 +31,14 @@ enum source_cookie {
     SOURCE_USER_BUS = 6,
     SOURCE_POWER_PROFILES = 7,
     SOURCE_SPAWN = 8,
-    SOURCE_FIXED_MAX = SOURCE_SPAWN,
+    SOURCE_PIPEWIRE = 9,
+    SOURCE_FIXED_MAX = SOURCE_PIPEWIRE,
 };
 
 struct app;
 struct generation;
 struct block;
+struct i3sd_pipewire_source;
 
 enum systemd_scope {
     SYSTEMD_SCOPE_SYSTEM,
@@ -191,6 +193,7 @@ struct app {
     struct i3sd_click_framer click_framer;
     struct systemd_bus systemd_buses[2];
     struct power_profiles_source power_profiles;
+    struct i3sd_pipewire_source *pipewire;
     struct i3sd_dbus_runtime *dbus;
     struct spawned_process spawn;
     uint64_t next_spawn_serial;

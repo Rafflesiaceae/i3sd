@@ -7,6 +7,7 @@
 #include "i3sd/output.h"
 #include "i3sd/timer.h"
 #include "i3sd/utf8.h"
+#include "pipewire.h"
 #include "power_profiles.h"
 #include "runtime.h"
 #include "spawn.h"
@@ -632,6 +633,18 @@ static int lua_context_watch_power_profiles(lua_State *lua) {
     return 1;
 }
 
+static int lua_context_watch_pipewire_volume(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct generation *generation = context->block->generation;
+    luaL_checktype(lua, 2, LUA_TFUNCTION);
+    if (generation->subscription_count == I3SD_MAX_TIMERS) {
+        return luaL_error(lua, "subscription limit reached");
+    }
+    generation->subscription_count++;
+    return i3sd_pipewire_watch(lua, generation->app->pipewire, context->block,
+                               2);
+}
+
 static int lua_spawn_cancel(lua_State *lua) {
     struct lua_spawn_handle *handle =
         luaL_checkudata(lua, 1, spawn_handle_metatable);
@@ -1184,7 +1197,8 @@ static int lua_has_feature(lua_State *lua) {
         strcmp(feature, "collectors") == 0 || strcmp(feature, "inotify") == 0 ||
         strcmp(feature, "psi") == 0 || strcmp(feature, "systemd") == 0 ||
         strcmp(feature, "power_profiles") == 0 ||
-        strcmp(feature, "spawn") == 0 || strcmp(feature, "dbus") == 0;
+        strcmp(feature, "spawn") == 0 || strcmp(feature, "dbus") == 0 ||
+        (I3SD_HAVE_PIPEWIRE && strcmp(feature, "pipewire") == 0);
     lua_pushboolean(lua, available);
     return 1;
 }
@@ -1205,6 +1219,8 @@ static int lua_features(lua_State *lua) {
     lua_setfield(lua, -2, "spawn");
     lua_pushboolean(lua, true);
     lua_setfield(lua, -2, "dbus");
+    lua_pushboolean(lua, I3SD_HAVE_PIPEWIRE);
+    lua_setfield(lua, -2, "pipewire");
     return 1;
 }
 
@@ -1369,6 +1385,7 @@ static void register_lua_api(struct generation *generation) {
         {"dbus", lua_context_dbus},
         {"_watch_systemd_failed", lua_context_watch_systemd_failed},
         {"_watch_power_profiles", lua_context_watch_power_profiles},
+        {"_watch_pipewire_volume", lua_context_watch_pipewire_volume},
         {"_set_power_profile", lua_context_set_power_profile},
         {NULL, NULL},
     };
@@ -1405,6 +1422,8 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, -2, "cancel");
     lua_setfield(lua, -2, "__index");
     lua_pop(lua, 1);
+
+    i3sd_pipewire_register_lua(lua);
 
     lua_newtable(lua);
     lua_pushinteger(lua, 1);
@@ -1558,6 +1577,7 @@ static void generation_destroy(struct generation *generation) {
         subscription->cancelled = true;
     }
     i3sd_dbus_generation_deactivate(generation->dbus);
+    i3sd_pipewire_retire_generation(generation->app->pipewire, generation);
     /* Lua finalizers can still inspect native handles, so close Lua first. */
     if (generation->lua != NULL) {
         lua_close(generation->lua);
@@ -1691,6 +1711,7 @@ void i3sd_fault_block(struct block *block) {
         }
     }
     i3sd_dbus_cancel_owner(generation->dbus, block);
+    i3sd_pipewire_cancel_owner(generation->app->pipewire, block);
     block_state_destroy(&block->state);
     i3sd_buffer_clear(&block->fragment);
     generation->app->render_dirty = true;
@@ -1757,6 +1778,7 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
     /* Reuse an authoritative shared-bus snapshot across generation reloads. */
     i3sd_systemd_notify(app);
     i3sd_power_profiles_notify(app);
+    i3sd_pipewire_notify(app->pipewire);
     app->render_dirty = true;
     return true;
 }
@@ -2120,6 +2142,10 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     if (dbus_deadline < deadline) {
         deadline = dbus_deadline;
     }
+    const uint64_t pipewire_deadline = i3sd_pipewire_deadline(app->pipewire);
+    if (pipewire_deadline < deadline) {
+        deadline = pipewire_deadline;
+    }
     if (app->reload_dirty || (app->render_dirty && app->last_render_ns == 0)) {
         return 0;
     }
@@ -2199,6 +2225,7 @@ static void run_event_loop(struct app *app) {
         i3sd_systemd_reconcile(&app->systemd_buses[0], now_ns);
         i3sd_systemd_reconcile(&app->systemd_buses[1], now_ns);
         i3sd_power_profiles_reconcile(&app->power_profiles, now_ns);
+        i3sd_pipewire_reconcile(app->pipewire, now_ns);
         i3sd_dbus_reconcile(app->dbus, app->current->dbus, now_ns);
         int event_count;
         do {
@@ -2238,6 +2265,9 @@ static void run_event_loop(struct app *app) {
             case SOURCE_SPAWN:
                 i3sd_spawn_read(app);
                 break;
+            case SOURCE_PIPEWIRE:
+                i3sd_pipewire_process(app->pipewire, monotonic_now_ns());
+                break;
             default:
                 i3sd_dbus_process_cookie(app->dbus, app->current->dbus,
                                          events[index].data.u64,
@@ -2250,6 +2280,7 @@ static void run_event_loop(struct app *app) {
         i3sd_systemd_process(&app->systemd_buses[0], now_ns);
         i3sd_systemd_process(&app->systemd_buses[1], now_ns);
         i3sd_power_profiles_process(&app->power_profiles, now_ns);
+        i3sd_pipewire_process(app->pipewire, now_ns);
         i3sd_dbus_process(app->dbus, app->current->dbus, now_ns);
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
@@ -2290,6 +2321,7 @@ static void app_destroy(struct app *app) {
         i3sd_power_profiles_close(&app->power_profiles);
     }
     i3sd_dbus_runtime_destroy(app->dbus);
+    i3sd_pipewire_destroy(app->pipewire);
     if (app->spawn.active) {
         i3sd_spawn_cancel(app);
     }
@@ -2437,6 +2469,13 @@ int main(int argc, char **argv) {
     }
 
     i3sd_output_init(&app.output);
+    /* Staging may register lazy PipeWire subscriptions before epoll exists. */
+    app.pipewire = i3sd_pipewire_create(&app);
+    if (app.pipewire == NULL) {
+        fprintf(stderr, "i3sd: unable to initialize PipeWire support\n");
+        app_destroy(&app);
+        return EXIT_FAILURE;
+    }
     struct generation *initial = stage_generation(&app);
     if (initial == NULL) {
         app_destroy(&app);

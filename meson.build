@@ -16,6 +16,7 @@ luajit = dependency('luajit')
 yyjson = dependency('yyjson')
 xxhash = dependency('libxxhash')
 systemd = dependency('libsystemd')
+pipewire = dependency('libpipewire-0.3', required: false)
 
 conf = configuration_data()
 conf.set_quoted('I3SD_VERSION', meson.project_version())
@@ -25,6 +26,7 @@ conf.set_quoted(
 )
 conf.set_quoted('I3SD_BUILD_EXECUTABLE', meson.current_build_dir() / 'i3sd')
 conf.set_quoted('I3SD_SOURCE_LUA_DIR', meson.current_source_dir() / 'lua')
+conf.set10('I3SD_HAVE_PIPEWIRE', pipewire.found())
 configure_file(output: 'config.h', configuration: conf)
 
 inc = include_directories('include', '.')
@@ -43,16 +45,22 @@ core = static_library(
     dependencies: [yyjson],
 )
 
+runtime_dependencies = [luajit, yyjson, xxhash, systemd, m]
+if pipewire.found()
+    runtime_dependencies += pipewire
+endif
+
 executable(
     'i3sd',
     'src/dbus.c',
     'src/main.c',
+    'src/pipewire.c',
     'src/power_profiles.c',
     'src/spawn.c',
     'src/systemd.c',
     include_directories: inc,
     link_with: core,
-    dependencies: [luajit, yyjson, xxhash, systemd, m],
+    dependencies: runtime_dependencies,
     install: true,
 )
 
@@ -70,6 +78,14 @@ test(
     args: [
         meson.current_build_dir() / 'i3sd',
         meson.current_source_dir() / 'tests/config/basic.lua',
+    ],
+)
+test(
+    'pipewire-config-check',
+    find_program('tests/check_config.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/pipewire.lua',
     ],
 )
 test(
@@ -104,6 +120,7 @@ install_data(
     'lua/i3sd/modules/cpu.lua',
     'lua/i3sd/modules/filesystem.lua',
     'lua/i3sd/modules/memory.lua',
+    'lua/i3sd/modules/pipewire_volume.lua',
     'lua/i3sd/modules/power_profiles.lua',
     'lua/i3sd/modules/systemd.lua',
     install_dir: get_option('datadir') / 'i3sd/lua/i3sd/modules',
