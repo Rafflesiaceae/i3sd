@@ -1,9 +1,23 @@
 local clock = require("i3sd.modules.clock")
 local filesystem = require("i3sd.modules.filesystem")
 local memory = require("i3sd.modules.memory")
+local systemd = require("i3sd.modules.systemd")
 
 local color_bad = "#FF0000"
 local color_degraded = "#FDD102"
+
+-- Failed system and user units are event-driven and hidden while healthy.
+systemd {
+    scope = "both",
+    order = 50,
+    format = function(value)
+        return {
+            full_text = ("systemd: %d failed"):format(value.count),
+            color = color_bad,
+            urgent = true,
+        }
+    end,
+}
 
 -- This reproduces the active path_exists VPN block through the generic local
 -- file metadata collector. It does not add a network-status backend to i3sd.

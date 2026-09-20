@@ -15,6 +15,7 @@ m = cc.find_library('m', required: true)
 luajit = dependency('luajit')
 yyjson = dependency('yyjson')
 xxhash = dependency('libxxhash')
+systemd = dependency('libsystemd')
 
 conf = configuration_data()
 conf.set_quoted('I3SD_VERSION', meson.project_version())
@@ -47,7 +48,7 @@ executable(
     'src/main.c',
     include_directories: inc,
     link_with: core,
-    dependencies: [luajit, yyjson, xxhash, m],
+    dependencies: [luajit, yyjson, xxhash, systemd, m],
     install: true,
 )
 
@@ -78,5 +79,6 @@ install_data(
     'lua/i3sd/modules/cpu.lua',
     'lua/i3sd/modules/filesystem.lua',
     'lua/i3sd/modules/memory.lua',
+    'lua/i3sd/modules/systemd.lua',
     install_dir: get_option('datadir') / 'i3sd/lua/i3sd/modules',
 )

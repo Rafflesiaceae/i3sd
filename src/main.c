@@ -10,6 +10,7 @@
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
+#include <systemd/sd-bus.h>
 #include <xxhash.h>
 #include <yyjson.h>
 
@@ -20,6 +21,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -51,11 +53,35 @@ enum source_cookie {
     SOURCE_STDIN = 2,
     SOURCE_STDOUT = 3,
     SOURCE_INOTIFY = 4,
+    SOURCE_SYSTEM_BUS = 5,
+    SOURCE_USER_BUS = 6,
 };
 
 struct app;
 struct generation;
 struct block;
+struct systemd_subscription;
+
+enum systemd_scope {
+    SYSTEMD_SCOPE_SYSTEM,
+    SYSTEMD_SCOPE_USER,
+    SYSTEMD_SCOPE_BOTH,
+};
+
+struct systemd_bus {
+    struct app *app;
+    sd_bus *bus;
+    sd_bus_slot *match_slot;
+    uint64_t cookie;
+    uint64_t retry_deadline_ns;
+    uint32_t failed_count;
+    int registered_fd;
+    uint32_t registered_events;
+    enum systemd_scope scope;
+    bool count_valid;
+    bool query_inflight;
+    bool subscribe_inflight;
+};
 
 struct block_state {
     char *full_text;
@@ -86,6 +112,14 @@ struct logical_timer {
     bool cancelled;
 };
 
+struct systemd_subscription {
+    struct systemd_subscription *next;
+    struct block *block;
+    int callback_ref;
+    enum systemd_scope scope;
+    bool cancelled;
+};
+
 struct block {
     struct generation *generation;
     char *name;
@@ -111,7 +145,9 @@ struct generation {
     struct block *ordered[I3SD_MAX_BLOCKS];
     size_t block_count;
     struct logical_timer *timers;
+    struct systemd_subscription *systemd_subscriptions;
     size_t timer_count;
+    size_t subscription_count;
     int push_uint64_ref;
     int push_int64_ref;
     bool staging;
@@ -136,6 +172,7 @@ struct app {
     struct i3sd_timer_heap timer_heap;
     struct i3sd_output output;
     struct i3sd_click_framer click_framer;
+    struct systemd_bus systemd_buses[2];
     struct i3sd_buffer frame;
     struct identity identities[4096];
     size_t identity_count;
@@ -156,10 +193,17 @@ struct lua_timer_handle {
     struct logical_timer *timer;
 };
 
+struct lua_systemd_handle {
+    struct systemd_subscription *subscription;
+};
+
 static const char protocol_prelude[] =
     "{\"version\":1,\"click_events\":true}\n[\n";
 static const char context_metatable[] = "i3sd.context";
 static const char timer_metatable[] = "i3sd.timer";
+static const char systemd_handle_metatable[] = "i3sd.systemd_handle";
+
+static void fault_block(struct block *block);
 
 static uint64_t monotonic_now_ns(void) {
     struct timespec now;
@@ -615,6 +659,55 @@ static int lua_context_every(lua_State *lua) {
     return create_lua_timer(lua, true);
 }
 
+static int lua_systemd_cancel(lua_State *lua) {
+    struct lua_systemd_handle *handle =
+        luaL_checkudata(lua, 1, systemd_handle_metatable);
+    if (handle->subscription != NULL) {
+        handle->subscription->cancelled = true;
+    }
+    return 0;
+}
+
+static int lua_context_watch_systemd_failed(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct generation *generation = context->block->generation;
+    const char *scope_name = luaL_checkstring(lua, 2);
+    luaL_checktype(lua, 3, LUA_TFUNCTION);
+    if (generation->subscription_count == I3SD_MAX_TIMERS) {
+        return luaL_error(lua, "subscription limit reached");
+    }
+
+    enum systemd_scope scope;
+    if (strcmp(scope_name, "system") == 0) {
+        scope = SYSTEMD_SCOPE_SYSTEM;
+    } else if (strcmp(scope_name, "user") == 0) {
+        scope = SYSTEMD_SCOPE_USER;
+    } else if (strcmp(scope_name, "both") == 0) {
+        scope = SYSTEMD_SCOPE_BOTH;
+    } else {
+        return luaL_error(lua, "systemd scope must be system, user, or both");
+    }
+
+    struct systemd_subscription *subscription =
+        calloc(1, sizeof(*subscription));
+    if (subscription == NULL) {
+        return luaL_error(lua, "out of memory creating systemd subscription");
+    }
+    subscription->block = context->block;
+    subscription->scope = scope;
+    lua_pushvalue(lua, 3);
+    subscription->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
+    subscription->next = generation->systemd_subscriptions;
+    generation->systemd_subscriptions = subscription;
+    generation->subscription_count++;
+
+    struct lua_systemd_handle *handle = lua_newuserdata(lua, sizeof(*handle));
+    handle->subscription = subscription;
+    luaL_getmetatable(lua, systemd_handle_metatable);
+    lua_setmetatable(lua, -2);
+    return 1;
+}
+
 static void push_error(lua_State *lua, const char *code, const char *message,
                        const char *source, int error_number) {
     lua_newtable(lua);
@@ -1000,9 +1093,9 @@ static int lua_context_sample(lua_State *lua) {
 
 static int lua_has_feature(lua_State *lua) {
     const char *feature = luaL_checkstring(lua, 1);
-    bool available = strcmp(feature, "collectors") == 0 ||
-                     strcmp(feature, "inotify") == 0 ||
-                     strcmp(feature, "psi") == 0;
+    bool available =
+        strcmp(feature, "collectors") == 0 || strcmp(feature, "inotify") == 0 ||
+        strcmp(feature, "psi") == 0 || strcmp(feature, "systemd") == 0;
     lua_pushboolean(lua, available);
     return 1;
 }
@@ -1015,6 +1108,8 @@ static int lua_features(lua_State *lua) {
     lua_setfield(lua, -2, "inotify");
     lua_pushboolean(lua, true);
     lua_setfield(lua, -2, "psi");
+    lua_pushboolean(lua, true);
+    lua_setfield(lua, -2, "systemd");
     return 1;
 }
 
@@ -1149,6 +1244,7 @@ static void register_lua_api(struct generation *generation) {
         {"after", lua_context_after},
         {"every", lua_context_every},
         {"sample", lua_context_sample},
+        {"_watch_systemd_failed", lua_context_watch_systemd_failed},
         {NULL, NULL},
     };
     luaL_register(lua, NULL, context_methods);
@@ -1162,6 +1258,13 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, lua_timer_cancel);
     lua_setfield(lua, -2, "__gc");
+    lua_pop(lua, 1);
+
+    luaL_newmetatable(lua, systemd_handle_metatable);
+    lua_newtable(lua);
+    lua_pushcfunction(lua, lua_systemd_cancel);
+    lua_setfield(lua, -2, "cancel");
+    lua_setfield(lua, -2, "__index");
     lua_pop(lua, 1);
 
     lua_newtable(lua);
@@ -1287,6 +1390,273 @@ static void configure_lua_path(struct generation *generation) {
     lua_pop(lua, 2);
 }
 
+static bool systemd_scope_uses(enum systemd_scope subscription_scope,
+                               enum systemd_scope bus_scope) {
+    return subscription_scope == SYSTEMD_SCOPE_BOTH ||
+           subscription_scope == bus_scope;
+}
+
+static bool systemd_bus_needed(const struct app *app,
+                               enum systemd_scope scope) {
+    if (app->current == NULL) {
+        return false;
+    }
+    for (struct systemd_subscription *subscription =
+             app->current->systemd_subscriptions;
+         subscription != NULL; subscription = subscription->next) {
+        if (!subscription->cancelled &&
+            systemd_scope_uses(subscription->scope, scope)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void notify_systemd_subscribers(struct app *app) {
+    struct generation *generation = app->current;
+    if (generation == NULL || generation->staging) {
+        return;
+    }
+    struct systemd_bus *system_bus = &app->systemd_buses[0];
+    struct systemd_bus *user_bus = &app->systemd_buses[1];
+    for (struct systemd_subscription *subscription =
+             generation->systemd_subscriptions;
+         subscription != NULL; subscription = subscription->next) {
+        struct block *block = subscription->block;
+        if (subscription->cancelled || block->faulted) {
+            continue;
+        }
+        if ((systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_SYSTEM) &&
+             !system_bus->count_valid) ||
+            (systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_USER) &&
+             !user_bus->count_valid)) {
+            continue;
+        }
+
+        uint32_t total = 0;
+        lua_State *lua = generation->lua;
+        lua_rawgeti(lua, LUA_REGISTRYINDEX, subscription->callback_ref);
+        lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
+        lua_newtable(lua);
+        if (systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_SYSTEM)) {
+            total += system_bus->failed_count;
+            lua_pushinteger(lua, system_bus->failed_count);
+            lua_setfield(lua, -2, "system_count");
+        }
+        if (systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_USER)) {
+            total += user_bus->failed_count;
+            lua_pushinteger(lua, user_bus->failed_count);
+            lua_setfield(lua, -2, "user_count");
+        }
+        lua_pushinteger(lua, total);
+        lua_setfield(lua, -2, "count");
+        if (lua_pcall(lua, 2, 0, 0) != 0) {
+            log_lua_error(block, "systemd event");
+            fault_block(block);
+        }
+    }
+}
+
+static int systemd_snapshot_reply(sd_bus_message *message, void *userdata,
+                                  sd_bus_error *ret_error) {
+    (void)ret_error;
+    struct systemd_bus *source = userdata;
+    source->query_inflight = false;
+    if (sd_bus_message_is_method_error(message, NULL)) {
+        source->count_valid = false;
+        return 0;
+    }
+    uint32_t count;
+    int result =
+        sd_bus_message_enter_container(message, SD_BUS_TYPE_VARIANT, "u");
+    if (result >= 0) {
+        result = sd_bus_message_read(message, "u", &count);
+    }
+    if (result < 0) {
+        source->count_valid = false;
+        return 0;
+    }
+    const bool changed = !source->count_valid || source->failed_count != count;
+    source->failed_count = count;
+    source->count_valid = true;
+    if (changed) {
+        notify_systemd_subscribers(source->app);
+    }
+    return 0;
+}
+
+static void request_systemd_snapshot(struct systemd_bus *source) {
+    if (source->bus == NULL || source->query_inflight) {
+        return;
+    }
+    int result = sd_bus_call_method_async(
+        source->bus, NULL, "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1", "org.freedesktop.DBus.Properties", "Get",
+        systemd_snapshot_reply, source, "ss",
+        "org.freedesktop.systemd1.Manager", "NFailedUnits");
+    if (result >= 0) {
+        source->query_inflight = true;
+    }
+}
+
+static int systemd_property_changed(sd_bus_message *message, void *userdata,
+                                    sd_bus_error *ret_error) {
+    (void)message;
+    (void)ret_error;
+    request_systemd_snapshot(userdata);
+    return 0;
+}
+
+static int systemd_subscribe_reply(sd_bus_message *message, void *userdata,
+                                   sd_bus_error *ret_error) {
+    (void)ret_error;
+    struct systemd_bus *source = userdata;
+    source->subscribe_inflight = false;
+    if (sd_bus_message_is_method_error(message, NULL)) {
+        const sd_bus_error *error = sd_bus_message_get_error(message);
+        if (error == NULL || error->name == NULL ||
+            strcmp(error->name, "org.freedesktop.systemd1.AlreadySubscribed") !=
+                0) {
+            source->count_valid = false;
+            return 0;
+        }
+    }
+    request_systemd_snapshot(source);
+    return 0;
+}
+
+static void request_systemd_subscribe(struct systemd_bus *source) {
+    if (source->bus == NULL || source->subscribe_inflight) {
+        return;
+    }
+    int result = sd_bus_call_method_async(
+        source->bus, NULL, "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+        "Subscribe", systemd_subscribe_reply, source, NULL);
+    if (result >= 0) {
+        source->subscribe_inflight = true;
+    }
+}
+
+static int systemd_match_installed(sd_bus_message *message, void *userdata,
+                                   sd_bus_error *ret_error) {
+    (void)ret_error;
+    struct systemd_bus *source = userdata;
+    if (!sd_bus_message_is_method_error(message, NULL)) {
+        request_systemd_subscribe(source);
+    }
+    return 0;
+}
+
+static void close_systemd_bus(struct systemd_bus *source) {
+    if (source->registered_fd >= 0) {
+        epoll_ctl(source->app->epoll_fd, EPOLL_CTL_DEL, source->registered_fd,
+                  NULL);
+    }
+    source->registered_fd = -1;
+    source->registered_events = 0;
+    source->match_slot = sd_bus_slot_unref(source->match_slot);
+    source->bus = sd_bus_flush_close_unref(source->bus);
+    source->count_valid = false;
+    source->query_inflight = false;
+    source->subscribe_inflight = false;
+}
+
+static bool open_systemd_bus(struct systemd_bus *source, uint64_t now_ns) {
+    int result = source->scope == SYSTEMD_SCOPE_SYSTEM
+                     ? sd_bus_open_system(&source->bus)
+                     : sd_bus_open_user(&source->bus);
+    if (result < 0) {
+        source->bus = NULL;
+        source->retry_deadline_ns = now_ns + 5000000000ULL;
+        return false;
+    }
+    sd_bus_set_exit_on_disconnect(source->bus, 0);
+    static const char match[] =
+        "type='signal',sender='org.freedesktop.systemd1',"
+        "path='/org/freedesktop/systemd1',"
+        "interface='org.freedesktop.DBus.Properties',"
+        "member='PropertiesChanged',"
+        "arg0='org.freedesktop.systemd1.Manager'";
+    result = sd_bus_add_match_async(source->bus, &source->match_slot, match,
+                                    systemd_property_changed,
+                                    systemd_match_installed, source);
+    if (result < 0) {
+        close_systemd_bus(source);
+        source->retry_deadline_ns = now_ns + 5000000000ULL;
+        return false;
+    }
+    source->retry_deadline_ns = 0;
+    return true;
+}
+
+static bool reconcile_systemd_bus(struct systemd_bus *source, uint64_t now_ns) {
+    if (!systemd_bus_needed(source->app, source->scope)) {
+        if (source->bus != NULL) {
+            close_systemd_bus(source);
+        }
+        return true;
+    }
+    if (source->bus == NULL) {
+        if (source->retry_deadline_ns > now_ns) {
+            return true;
+        }
+        if (!open_systemd_bus(source, now_ns)) {
+            return true;
+        }
+    }
+
+    const int fd = sd_bus_get_fd(source->bus);
+    const int poll_events = sd_bus_get_events(source->bus);
+    if (fd < 0 || poll_events < 0) {
+        close_systemd_bus(source);
+        source->retry_deadline_ns = now_ns + 5000000000ULL;
+        return true;
+    }
+    uint32_t events = EPOLLERR | EPOLLHUP;
+    if ((poll_events & POLLIN) != 0) {
+        events |= EPOLLIN;
+    }
+    if ((poll_events & POLLOUT) != 0) {
+        events |= EPOLLOUT;
+    }
+    if (source->registered_fd == fd && source->registered_events == events) {
+        return true;
+    }
+    if (source->registered_fd >= 0) {
+        epoll_ctl(source->app->epoll_fd, EPOLL_CTL_DEL, source->registered_fd,
+                  NULL);
+        source->registered_fd = -1;
+    }
+    struct epoll_event event = {.events = events, .data.u64 = source->cookie};
+    if (epoll_ctl(source->app->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        close_systemd_bus(source);
+        source->retry_deadline_ns = now_ns + 5000000000ULL;
+        return false;
+    }
+    source->registered_fd = fd;
+    source->registered_events = events;
+    return true;
+}
+
+static void process_systemd_bus(struct systemd_bus *source, uint64_t now_ns) {
+    if (source->bus == NULL) {
+        return;
+    }
+    for (size_t count = 0; count < 256; count++) {
+        int result = sd_bus_process(source->bus, NULL);
+        if (result > 0) {
+            continue;
+        }
+        if (result < 0) {
+            close_systemd_bus(source);
+            source->retry_deadline_ns = now_ns + 5000000000ULL;
+        }
+        break;
+    }
+    reconcile_systemd_bus(source, now_ns);
+}
+
 static void generation_destroy(struct generation *generation) {
     if (generation == NULL) {
         return;
@@ -1299,6 +1669,11 @@ static void generation_destroy(struct generation *generation) {
         timer->cancelled = true;
         timer = timer->next;
     }
+    for (struct systemd_subscription *subscription =
+             generation->systemd_subscriptions;
+         subscription != NULL; subscription = subscription->next) {
+        subscription->cancelled = true;
+    }
     /* Lua finalizers can still inspect native handles, so close Lua first. */
     if (generation->lua != NULL) {
         lua_close(generation->lua);
@@ -1308,6 +1683,13 @@ static void generation_destroy(struct generation *generation) {
         struct logical_timer *next = timer->next;
         free(timer);
         timer = next;
+    }
+    struct systemd_subscription *subscription =
+        generation->systemd_subscriptions;
+    while (subscription != NULL) {
+        struct systemd_subscription *next = subscription->next;
+        free(subscription);
+        subscription = next;
     }
     for (size_t index = 0; index < generation->block_count; index++) {
         block_destroy(generation->blocks[index]);
@@ -1392,6 +1774,13 @@ static void fault_block(struct block *block) {
             timer->cancelled = true;
         }
     }
+    for (struct systemd_subscription *subscription =
+             generation->systemd_subscriptions;
+         subscription != NULL; subscription = subscription->next) {
+        if (subscription->block == block) {
+            subscription->cancelled = true;
+        }
+    }
     block_state_destroy(&block->state);
     i3sd_buffer_clear(&block->fragment);
     generation->app->render_dirty = true;
@@ -1455,6 +1844,8 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
         }
     }
     generation_destroy(old);
+    /* Reuse an authoritative shared-bus snapshot across generation reloads. */
+    notify_systemd_subscribers(app);
     app->render_dirty = true;
     return true;
 }
@@ -1757,6 +2148,28 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
             deadline = render_deadline;
         }
     }
+    for (size_t index = 0; index < 2; index++) {
+        struct systemd_bus *source = &app->systemd_buses[index];
+        if (!systemd_bus_needed(app, source->scope)) {
+            continue;
+        }
+        if (source->bus == NULL) {
+            if (source->retry_deadline_ns != 0 &&
+                source->retry_deadline_ns < deadline) {
+                deadline = source->retry_deadline_ns;
+            }
+            continue;
+        }
+        uint64_t timeout_us;
+        if (sd_bus_get_timeout(source->bus, &timeout_us) >= 0 &&
+            timeout_us != UINT64_MAX) {
+            const uint64_t timeout_ns =
+                timeout_us > UINT64_MAX / 1000 ? UINT64_MAX : timeout_us * 1000;
+            if (timeout_ns < deadline) {
+                deadline = timeout_ns;
+            }
+        }
+    }
     if (app->reload_dirty || (app->render_dirty && app->last_render_ns == 0)) {
         return 0;
     }
@@ -1796,6 +2209,18 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
     if (app->config_watch < 0) {
         return false;
     }
+    app->systemd_buses[0] = (struct systemd_bus){
+        .app = app,
+        .cookie = SOURCE_SYSTEM_BUS,
+        .registered_fd = -1,
+        .scope = SYSTEMD_SCOPE_SYSTEM,
+    };
+    app->systemd_buses[1] = (struct systemd_bus){
+        .app = app,
+        .cookie = SOURCE_USER_BUS,
+        .registered_fd = -1,
+        .scope = SYSTEMD_SCOPE_USER,
+    };
     return add_epoll_fd(app, app->signal_fd, EPOLLIN, SOURCE_SIGNAL) &&
            add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
                         SOURCE_STDIN) &&
@@ -1808,6 +2233,8 @@ static void run_event_loop(struct app *app) {
     app->running = true;
     while (app->running) {
         uint64_t now_ns = monotonic_now_ns();
+        reconcile_systemd_bus(&app->systemd_buses[0], now_ns);
+        reconcile_systemd_bus(&app->systemd_buses[1], now_ns);
         int event_count;
         do {
             event_count = epoll_wait(app->epoll_fd, events, I3SD_EPOLL_EVENTS,
@@ -1831,12 +2258,20 @@ static void run_event_loop(struct app *app) {
             case SOURCE_INOTIFY:
                 handle_inotify(app);
                 break;
+            case SOURCE_SYSTEM_BUS:
+                process_systemd_bus(&app->systemd_buses[0], monotonic_now_ns());
+                break;
+            case SOURCE_USER_BUS:
+                process_systemd_bus(&app->systemd_buses[1], monotonic_now_ns());
+                break;
             default:
                 break;
             }
         }
 
         now_ns = monotonic_now_ns();
+        process_systemd_bus(&app->systemd_buses[0], now_ns);
+        process_systemd_bus(&app->systemd_buses[1], now_ns);
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
             app->reload_dirty = false;
@@ -1862,6 +2297,12 @@ static void run_event_loop(struct app *app) {
 
 static void app_destroy(struct app *app) {
     generation_destroy(app->current);
+    if (app->systemd_buses[0].bus != NULL) {
+        close_systemd_bus(&app->systemd_buses[0]);
+    }
+    if (app->systemd_buses[1].bus != NULL) {
+        close_systemd_bus(&app->systemd_buses[1]);
+    }
     i3sd_timer_heap_destroy(&app->timer_heap);
     i3sd_output_destroy(&app->output);
     i3sd_click_framer_destroy(&app->click_framer);

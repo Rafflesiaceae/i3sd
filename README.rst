@@ -12,7 +12,7 @@ Build
    meson compile -C build
    meson test -C build
 
-The required development dependencies are LuaJIT, yyjson and xxHash.
+The required development dependencies are LuaJIT, yyjson, xxHash and libsystemd.
 
 Configuration
 -------------
@@ -41,8 +41,10 @@ The high-level Lua modules can be loaded explicitly:
 
    local clock = require("i3sd.modules.clock")
    local memory = require("i3sd.modules.memory")
+   local systemd = require("i3sd.modules.systemd")
 
    clock { format = "%H:%M" }
    memory { warn_below = 20, critical_below = 10 }
+   systemd { scope = "both" }
 
 Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for the complete architecture, API contracts and delivery roadmap.
