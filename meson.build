@@ -79,6 +79,7 @@ install_data(
     'lua/i3sd/modules/cpu.lua',
     'lua/i3sd/modules/filesystem.lua',
     'lua/i3sd/modules/memory.lua',
+    'lua/i3sd/modules/power_profiles.lua',
     'lua/i3sd/modules/systemd.lua',
     install_dir: get_option('datadir') / 'i3sd/lua/i3sd/modules',
 )
