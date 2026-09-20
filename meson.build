@@ -82,6 +82,18 @@ test(
         meson.current_source_dir() / 'tests/fake_rofi.sh',
     ],
 )
+busctl = find_program('busctl')
+test(
+    'dbus-api',
+    find_program('dbus-run-session'),
+    args: [
+        meson.current_source_dir() / 'tests/test_dbus.sh',
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/dbus.lua',
+        busctl.full_path(),
+    ],
+    timeout: 15,
+)
 
 install_data(
     'lua/i3sd/modules/clock.lua',

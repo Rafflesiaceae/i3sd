@@ -70,3 +70,54 @@ active, or when process setup fails:
 The returned handle has an idempotent ``cancel()`` method. The
 ``power_profiles`` module uses this primitive to implement its left-click rofi
 selector entirely in Lua. Install ``rofi`` when using that module.
+
+D-Bus module API
+----------------
+
+Lua modules can lazily acquire the shared system or user bus and use it without
+blocking the status loop:
+
+.. code:: lua
+
+   local bus = ctx:dbus("user")
+   local match = bus:match({
+       sender = "org.example.Service",
+       path = "/org/example/Object",
+       interface = "org.example.Interface",
+       member = "Changed",
+   }, function(message)
+       local name, value = message:read("su")
+       ctx:set { full_text = name .. ": " .. value }
+   end, function(error)
+       assert(error == nil, error and error.message)
+   end)
+
+   local call = bus:call({
+       destination = "org.example.Service",
+       path = "/org/example/Object",
+       interface = "org.example.Interface",
+       member = "GetState",
+       signature = "",
+       args = {},
+       timeout = 5,
+   }, function(reply, error)
+       if error == nil then
+           local state = reply:read("s")
+           ctx:set { full_text = state }
+       end
+   end)
+
+``bus:on_connect(callback)`` reports every connection epoch so modules can redo
+connection-scoped initialization after a reconnect. All three operations return
+cancellable handles owned by the block generation; retain a handle while its
+operation should stay active. Calls are sent only after the staged configuration
+becomes live, are never synchronously waited for, and are not replayed after a
+disconnect.
+
+Signatures are explicit. Basic values, arrays, structs, ordered dictionary pair
+sequences, and variants are supported. ``ay`` is represented as a binary Lua
+string, and ``x``/``t`` decode to exact LuaJIT ``int64_t``/``uint64_t`` cdata.
+Use ``i3sd.dbus.dict(entries)`` to validate a dictionary pair sequence and
+``i3sd.dbus.variant(signature, value)`` to create a variant. Message objects are
+valid only for the duration of their callback, while values returned by
+``message:read(signature)`` are ordinary owned Lua values.
