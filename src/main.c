@@ -10,6 +10,7 @@
 #include "i3sd/utf8.h"
 #include "pipewire.h"
 #include "power_profiles.h"
+#include "power_supply_events.h"
 #include "runtime.h"
 #include "spawn.h"
 #include "systemd.h"
@@ -71,6 +72,10 @@ struct lua_power_profiles_handle {
     struct power_profiles_subscription *subscription;
 };
 
+struct lua_power_supply_handle {
+    struct power_supply_subscription *subscription;
+};
+
 struct lua_spawn_handle {
     struct app *app;
     uint64_t serial;
@@ -83,6 +88,8 @@ static const char timer_metatable[] = "i3sd.timer";
 static const char systemd_handle_metatable[] = "i3sd.systemd_handle";
 static const char power_profiles_handle_metatable[] =
     "i3sd.power_profiles_handle";
+static const char power_supply_handle_metatable[] =
+    "i3sd.power_supply_handle";
 static const char spawn_handle_metatable[] = "i3sd.spawn_handle";
 
 static bool make_nonblocking(int fd);
@@ -629,6 +636,43 @@ static int lua_context_watch_power_profiles(lua_State *lua) {
     return 1;
 }
 
+static int lua_power_supply_cancel(lua_State *lua) {
+    struct lua_power_supply_handle *handle =
+        luaL_checkudata(lua, 1, power_supply_handle_metatable);
+    if (handle->subscription != NULL) {
+        handle->subscription->cancelled = true;
+    }
+    return 0;
+}
+
+static int lua_context_watch_power_supply(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct generation *generation = context->block->generation;
+    luaL_checktype(lua, 2, LUA_TFUNCTION);
+    if (generation->subscription_count == I3SD_MAX_TIMERS) {
+        return luaL_error(lua, "subscription limit reached");
+    }
+    struct power_supply_subscription *subscription =
+        calloc(1, sizeof(*subscription));
+    if (subscription == NULL) {
+        return luaL_error(lua,
+                          "out of memory creating power supply subscription");
+    }
+    subscription->block = context->block;
+    lua_pushvalue(lua, 2);
+    subscription->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
+    subscription->next = generation->power_supply_subscriptions;
+    generation->power_supply_subscriptions = subscription;
+    generation->subscription_count++;
+
+    struct lua_power_supply_handle *handle =
+        lua_newuserdata(lua, sizeof(*handle));
+    handle->subscription = subscription;
+    luaL_getmetatable(lua, power_supply_handle_metatable);
+    lua_setmetatable(lua, -2);
+    return 1;
+}
+
 static int lua_context_watch_pipewire_volume(lua_State *lua) {
     struct lua_context *context = check_context(lua, 1);
     struct generation *generation = context->block->generation;
@@ -1045,6 +1089,7 @@ static void register_lua_api(struct generation *generation) {
         {"dbus", lua_context_dbus},
         {"_watch_systemd_failed", lua_context_watch_systemd_failed},
         {"_watch_power_profiles", lua_context_watch_power_profiles},
+        {"_watch_power_supply", lua_context_watch_power_supply},
         {"_watch_pipewire_volume", lua_context_watch_pipewire_volume},
         {"_set_power_profile", lua_context_set_power_profile},
         {NULL, NULL},
@@ -1059,6 +1104,15 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, -2, "cancel");
     lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, lua_timer_cancel);
+    lua_setfield(lua, -2, "__gc");
+    lua_pop(lua, 1);
+
+    luaL_newmetatable(lua, power_supply_handle_metatable);
+    lua_newtable(lua);
+    lua_pushcfunction(lua, lua_power_supply_cancel);
+    lua_setfield(lua, -2, "cancel");
+    lua_setfield(lua, -2, "__index");
+    lua_pushcfunction(lua, lua_power_supply_cancel);
     lua_setfield(lua, -2, "__gc");
     lua_pop(lua, 1);
 
@@ -1236,6 +1290,11 @@ static void generation_destroy(struct generation *generation) {
          subscription != NULL; subscription = subscription->next) {
         subscription->cancelled = true;
     }
+    for (struct power_supply_subscription *subscription =
+             generation->power_supply_subscriptions;
+         subscription != NULL; subscription = subscription->next) {
+        subscription->cancelled = true;
+    }
     i3sd_dbus_generation_deactivate(generation->dbus);
     i3sd_pipewire_retire_generation(generation->app->pipewire, generation);
     /* Lua finalizers can still inspect native handles, so close Lua first. */
@@ -1262,6 +1321,13 @@ static void generation_destroy(struct generation *generation) {
         struct power_profiles_subscription *next = power_subscription->next;
         free(power_subscription);
         power_subscription = next;
+    }
+    struct power_supply_subscription *supply_subscription =
+        generation->power_supply_subscriptions;
+    while (supply_subscription != NULL) {
+        struct power_supply_subscription *next = supply_subscription->next;
+        free(supply_subscription);
+        supply_subscription = next;
     }
     for (size_t index = 0; index < generation->block_count; index++) {
         block_destroy(generation->blocks[index]);
@@ -1365,6 +1431,13 @@ void i3sd_fault_block(struct block *block) {
     }
     for (struct power_profiles_subscription *subscription =
              generation->power_profiles_subscriptions;
+         subscription != NULL; subscription = subscription->next) {
+        if (subscription->block == block) {
+            subscription->cancelled = true;
+        }
+    }
+    for (struct power_supply_subscription *subscription =
+             generation->power_supply_subscriptions;
          subscription != NULL; subscription = subscription->next) {
         if (subscription->block == block) {
             subscription->cancelled = true;
@@ -1806,6 +1879,11 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     if (pipewire_deadline < deadline) {
         deadline = pipewire_deadline;
     }
+    const uint64_t power_supply_deadline =
+        i3sd_power_supply_deadline(&app->power_supply);
+    if (power_supply_deadline < deadline) {
+        deadline = power_supply_deadline;
+    }
     if (app->reload_dirty || (app->render_dirty && app->last_render_ns == 0)) {
         return 0;
     }
@@ -1863,6 +1941,10 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
         .app = app,
         .registered_fd = -1,
     };
+    app->power_supply = (struct power_supply_source){
+        .app = app,
+        .fd = -1,
+    };
     app->dbus =
         i3sd_dbus_runtime_create(app->epoll_fd, &app->next_registration_cookie);
     if (app->dbus == NULL) {
@@ -1885,6 +1967,7 @@ static void run_event_loop(struct app *app) {
         i3sd_systemd_reconcile(&app->systemd_buses[0], now_ns);
         i3sd_systemd_reconcile(&app->systemd_buses[1], now_ns);
         i3sd_power_profiles_reconcile(&app->power_profiles, now_ns);
+        i3sd_power_supply_reconcile(&app->power_supply, now_ns);
         i3sd_pipewire_reconcile(app->pipewire, now_ns);
         i3sd_dbus_reconcile(app->dbus, app->current->dbus, now_ns);
         int event_count;
@@ -1921,6 +2004,10 @@ static void run_event_loop(struct app *app) {
             case SOURCE_POWER_PROFILES:
                 i3sd_power_profiles_process(&app->power_profiles,
                                             monotonic_now_ns());
+                break;
+            case SOURCE_POWER_SUPPLY:
+                i3sd_power_supply_process(&app->power_supply,
+                                          monotonic_now_ns());
                 break;
             case SOURCE_SPAWN:
                 i3sd_spawn_read(app);
@@ -1980,6 +2067,7 @@ static void app_destroy(struct app *app) {
     if (app->power_profiles.bus != NULL) {
         i3sd_power_profiles_close(&app->power_profiles);
     }
+    i3sd_power_supply_close(&app->power_supply);
     i3sd_dbus_runtime_destroy(app->dbus);
     i3sd_pipewire_destroy(app->pipewire);
     if (app->spawn.active) {
@@ -2077,6 +2165,7 @@ int main(int argc, char **argv) {
         .signal_fd = -1,
         .inotify_fd = -1,
         .config_watch = -1,
+        .power_supply = {.fd = -1},
     };
     bool check_only = false;
     static const struct option options[] = {

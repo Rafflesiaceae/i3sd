@@ -91,66 +91,74 @@ return function(options)
         return "🔋" .. charge .. status .. format_remaining(value.remaining_minutes)
     end
 
+    local function refresh(ctx)
+        local snapshot = ctx:sample("power_supply")
+        if snapshot == nil then
+            ctx:set { full_text = "" }
+            return
+        end
+        local battery
+        for _, supply in ipairs(snapshot.supplies) do
+            if supply.type == "Battery" then
+                battery = supply
+                break
+            end
+        end
+        if battery == nil then
+            ctx:set { full_text = "" }
+            return
+        end
+
+        -- Prefer energy values, then use charge values when the driver lacks energy data.
+        local percent = percentage(battery.energy_now_uwh, battery.energy_full_uwh)
+            or percentage(battery.charge_now_uah, battery.charge_full_uah)
+        local severity
+        if percent ~= nil then
+            if percent <= critical_below then
+                severity = "critical"
+            elseif percent <= low_below then
+                severity = "warning"
+            end
+        end
+        local active_status = battery.status == "Charging" or battery.status == "Discharging"
+        -- Auto mode keeps useful charge activity visible and hides a healthy full battery.
+        if show == "auto" and not active_status and severity == nil then
+            ctx:set { full_text = "" }
+            return
+        end
+
+        local value = {
+            name = battery.name,
+            status = battery.status,
+            percent = percent,
+            remaining_minutes = remaining_minutes(battery),
+            severity = severity,
+        }
+        local rendered = formatter(value)
+        if rendered == nil or rendered == false then
+            ctx:set { full_text = "" }
+        elseif type(rendered) == "string" then
+            ctx:set {
+                full_text = rendered,
+                color = severity == "critical" and "#ff0000" or severity == "warning" and "#ffaa00" or nil,
+                urgent = severity == "critical",
+            }
+        else
+            ctx:set(rendered)
+        end
+    end
+
     block {
         name = "battery",
         key = options.key,
         order = options.order or 0,
+        -- Keep a slow resync poll in case the kernel event socket drops an update.
         interval = interval,
-        update = function(ctx)
-            local snapshot = ctx:sample("power_supply")
-            if snapshot == nil then
-                ctx:set { full_text = "" }
-                return
-            end
-            local battery
-            for _, supply in ipairs(snapshot.supplies) do
-                if supply.type == "Battery" then
-                    battery = supply
-                    break
-                end
-            end
-            if battery == nil then
-                ctx:set { full_text = "" }
-                return
-            end
-
-            -- Prefer energy values, then use charge values when the driver lacks energy data.
-            local percent = percentage(battery.energy_now_uwh, battery.energy_full_uwh)
-                or percentage(battery.charge_now_uah, battery.charge_full_uah)
-            local severity
-            if percent ~= nil then
-                if percent <= critical_below then
-                    severity = "critical"
-                elseif percent <= low_below then
-                    severity = "warning"
-                end
-            end
-            local active_status = battery.status == "Charging" or battery.status == "Discharging"
-            -- Auto mode keeps useful charge activity visible and hides a healthy full battery.
-            if show == "auto" and not active_status and severity == nil then
-                ctx:set { full_text = "" }
-                return
-            end
-
-            local value = {
-                name = battery.name,
-                status = battery.status,
-                percent = percent,
-                remaining_minutes = remaining_minutes(battery),
-                severity = severity,
-            }
-            local rendered = formatter(value)
-            if rendered == nil or rendered == false then
-                ctx:set { full_text = "" }
-            elseif type(rendered) == "string" then
-                ctx:set {
-                    full_text = rendered,
-                    color = severity == "critical" and "#ff0000" or severity == "warning" and "#ffaa00" or nil,
-                    urgent = severity == "critical",
-                }
-            else
-                ctx:set(rendered)
-            end
+        init = function(ctx)
+            handle = ctx:_watch_power_supply(function(event_ctx)
+                refresh(event_ctx)
+            end)
         end,
+        update = refresh,
     }
 end

@@ -32,7 +32,8 @@ enum source_cookie {
     SOURCE_POWER_PROFILES = 7,
     SOURCE_SPAWN = 8,
     SOURCE_PIPEWIRE = 9,
-    SOURCE_FIXED_MAX = SOURCE_PIPEWIRE,
+    SOURCE_POWER_SUPPLY = 10,
+    SOURCE_FIXED_MAX = SOURCE_POWER_SUPPLY,
 };
 
 struct app;
@@ -105,6 +106,13 @@ struct power_profiles_subscription {
     bool cancelled;
 };
 
+struct power_supply_subscription {
+    struct power_supply_subscription *next;
+    struct block *block;
+    int callback_ref;
+    bool cancelled;
+};
+
 struct power_profiles_source {
     struct app *app;
     sd_bus *bus;
@@ -119,6 +127,12 @@ struct power_profiles_source {
     bool profiles_valid;
     bool active_query_inflight;
     bool profiles_query_inflight;
+};
+
+struct power_supply_source {
+    struct app *app;
+    uint64_t retry_deadline_ns;
+    int fd;
 };
 
 struct spawned_process {
@@ -164,6 +178,7 @@ struct generation {
     struct logical_timer *timers;
     struct systemd_subscription *systemd_subscriptions;
     struct power_profiles_subscription *power_profiles_subscriptions;
+    struct power_supply_subscription *power_supply_subscriptions;
     struct i3sd_dbus_generation *dbus;
     size_t timer_count;
     size_t subscription_count;
@@ -193,6 +208,7 @@ struct app {
     struct i3sd_click_framer click_framer;
     struct systemd_bus systemd_buses[2];
     struct power_profiles_source power_profiles;
+    struct power_supply_source power_supply;
     struct i3sd_pipewire_source *pipewire;
     struct i3sd_dbus_runtime *dbus;
     struct spawned_process spawn;

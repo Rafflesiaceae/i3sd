@@ -81,6 +81,9 @@ The returned handle has an idempotent ``cancel()`` method. The
 ``power_profiles`` module uses this primitive to implement its left-click rofi
 selector entirely in Lua. Install ``rofi`` when using that module.
 
+The ``battery`` module refreshes immediately on Linux power-supply change
+events and keeps a slower periodic sample as a resynchronization fallback.
+
 D-Bus module API
 ----------------
 

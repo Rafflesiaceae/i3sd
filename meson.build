@@ -57,6 +57,7 @@ executable(
     'src/main.c',
     'src/pipewire.c',
     'src/power_profiles.c',
+    'src/power_supply_events.c',
     'src/spawn.c',
     'src/systemd.c',
     include_directories: inc,
