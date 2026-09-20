@@ -51,20 +51,22 @@ The high-level Lua modules can be loaded explicitly:
 
 Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for the complete architecture, API contracts and delivery roadmap.
 
-Lua modules can open an asynchronous rofi menu from a block callback. The
-selection is ``nil`` when the menu is cancelled, and ``ctx:rofi`` returns
-``false`` when another menu is already open:
+Lua modules can start one bounded asynchronous child process from a block
+callback. ``ctx:spawn`` returns ``nil`` during staging, when another child is
+active, or when process setup fails:
 
 .. code:: lua
 
-   ctx:rofi({
-       prompt = "Action",
-       choices = { "first", "second" },
-   }, function(menu_ctx, selected)
-       if selected ~= nil then
-           -- Apply the selected action without blocking the status loop.
+   local process = ctx:spawn({
+       argv = { "example-command", "--mode", "menu" },
+       stdin = "first\nsecond\n",
+       stdout_limit = 1024,
+   }, function(process_ctx, result)
+       if result.success then
+           process_ctx:set { full_text = result.stdout }
        end
    end)
 
-The ``power_profiles`` module uses this primitive for its left-click profile
-selector. Install ``rofi`` when using modules that open menus.
+The returned handle has an idempotent ``cancel()`` method. The
+``power_profiles`` module uses this primitive to implement its left-click rofi
+selector entirely in Lua. Install ``rofi`` when using that module.

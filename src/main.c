@@ -49,10 +49,12 @@
 #define I3SD_TIMER_BUDGET 256U
 #define I3SD_OUTPUT_BUDGET (1024U * 1024U)
 #define I3SD_RENDER_INTERVAL_NS 50000000ULL
-#define I3SD_ROFI_CHOICE_LIMIT 256U
-#define I3SD_ROFI_CHOICE_BYTES 1024U
-#define I3SD_ROFI_INPUT_BYTES (64U * 1024U)
-#define I3SD_ROFI_PROMPT_BYTES 256U
+#define I3SD_SPAWN_ARG_LIMIT 64U
+#define I3SD_SPAWN_ARG_BYTES 4096U
+#define I3SD_SPAWN_ARGV_BYTES (64U * 1024U)
+#define I3SD_SPAWN_INPUT_BYTES (64U * 1024U)
+#define I3SD_SPAWN_OUTPUT_BYTES (64U * 1024U)
+#define I3SD_SPAWN_READ_BUDGET (64U * 1024U)
 
 enum source_cookie {
     SOURCE_SIGNAL = 1,
@@ -62,7 +64,7 @@ enum source_cookie {
     SOURCE_SYSTEM_BUS = 5,
     SOURCE_USER_BUS = 6,
     SOURCE_POWER_PROFILES = 7,
-    SOURCE_ROFI = 8,
+    SOURCE_SPAWN = 8,
 };
 
 struct app;
@@ -155,13 +157,20 @@ struct power_profiles_source {
     bool profiles_query_inflight;
 };
 
-struct rofi_menu {
+struct spawned_process {
     pid_t pid;
     int output_fd;
     struct block *block;
     int callback_ref;
-    char result[I3SD_ROFI_CHOICE_BYTES + 2];
-    size_t result_len;
+    uint64_t serial;
+    size_t output_limit;
+    int wait_status;
+    struct i3sd_buffer output;
+    bool active;
+    bool output_closed;
+    bool exited;
+    bool overflow;
+    bool io_error;
 };
 
 struct block {
@@ -219,7 +228,8 @@ struct app {
     struct i3sd_click_framer click_framer;
     struct systemd_bus systemd_buses[2];
     struct power_profiles_source power_profiles;
-    struct rofi_menu rofi;
+    struct spawned_process spawn;
+    uint64_t next_spawn_serial;
     struct i3sd_buffer frame;
     struct identity identities[4096];
     size_t identity_count;
@@ -248,6 +258,11 @@ struct lua_power_profiles_handle {
     struct power_profiles_subscription *subscription;
 };
 
+struct lua_spawn_handle {
+    struct app *app;
+    uint64_t serial;
+};
+
 static const char protocol_prelude[] =
     "{\"version\":1,\"click_events\":true}\n[\n";
 static const char context_metatable[] = "i3sd.context";
@@ -255,13 +270,14 @@ static const char timer_metatable[] = "i3sd.timer";
 static const char systemd_handle_metatable[] = "i3sd.systemd_handle";
 static const char power_profiles_handle_metatable[] =
     "i3sd.power_profiles_handle";
+static const char spawn_handle_metatable[] = "i3sd.spawn_handle";
 
 static void fault_block(struct block *block);
-static bool open_rofi_menu(struct app *app, struct block *block,
-                           const char *prompt, const char *choices,
-                           size_t choices_len, int callback_ref);
-static void cancel_rofi_menu(struct app *app,
-                             const struct generation *generation);
+static bool open_spawn_process(struct app *app, struct block *block,
+                               char *const argv[], const char *input,
+                               size_t input_len, size_t output_limit,
+                               int callback_ref, uint64_t serial);
+static void cancel_spawn_process(struct app *app);
 static bool set_power_profile(struct app *app, const char *profile);
 static bool known_power_profile(const struct power_profiles_source *source,
                                 const char *profile);
@@ -807,113 +823,142 @@ static int lua_context_watch_power_profiles(lua_State *lua) {
     return 1;
 }
 
-static int lua_context_rofi(lua_State *lua) {
+static int lua_spawn_cancel(lua_State *lua) {
+    struct lua_spawn_handle *handle =
+        luaL_checkudata(lua, 1, spawn_handle_metatable);
+    if (handle->app->spawn.active &&
+        handle->app->spawn.serial == handle->serial) {
+        cancel_spawn_process(handle->app);
+    }
+    return 0;
+}
+
+static int lua_context_spawn(lua_State *lua) {
     struct lua_context *context = check_context(lua, 1);
     struct block *block = context->block;
     luaL_checktype(lua, 2, LUA_TTABLE);
     luaL_checktype(lua, 3, LUA_TFUNCTION);
-    static const char *const fields[] = {"prompt", "choices"};
+    static const char *const fields[] = {"argv", "stdin", "stdout_limit"};
     check_strict_table(lua, 2, fields, sizeof(fields) / sizeof(fields[0]));
 
-    lua_getfield(lua, 2, "prompt");
-    const char *prompt = "Select";
-    if (!lua_isnil(lua, -1)) {
-        luaL_checktype(lua, -1, LUA_TSTRING);
-        size_t prompt_len;
-        prompt = luaL_checklstring(lua, -1, &prompt_len);
-        if (!valid_text(prompt, prompt_len, I3SD_ROFI_PROMPT_BYTES) ||
-            memchr(prompt, '\n', prompt_len) != NULL ||
-            memchr(prompt, '\r', prompt_len) != NULL) {
-            return luaL_error(lua,
-                              "rofi prompt must be one line of valid "
-                              "UTF-8 up to %u bytes",
-                              I3SD_ROFI_PROMPT_BYTES);
-        }
-    }
-
-    lua_getfield(lua, 2, "choices");
+    lua_getfield(lua, 2, "argv");
     luaL_checktype(lua, -1, LUA_TTABLE);
-    const int choices_index = lua_gettop(lua);
-    const size_t choice_count = lua_objlen(lua, choices_index);
-    if (choice_count == 0 || choice_count > I3SD_ROFI_CHOICE_LIMIT) {
-        return luaL_error(lua, "rofi choices must contain 1 to %u entries",
-                          I3SD_ROFI_CHOICE_LIMIT);
+    const int argv_index = lua_gettop(lua);
+    const size_t argc = lua_objlen(lua, argv_index);
+    if (argc == 0 || argc > I3SD_SPAWN_ARG_LIMIT) {
+        return luaL_error(lua, "spawn argv must contain 1 to %u entries",
+                          I3SD_SPAWN_ARG_LIMIT);
     }
 
-    /* Reject sparse or keyed tables so menu order is fully deterministic. */
+    /* Reject sparse or keyed argv tables so execution is deterministic. */
     size_t encountered = 0;
     lua_pushnil(lua);
-    while (lua_next(lua, choices_index) != 0) {
+    while (lua_next(lua, argv_index) != 0) {
         if (lua_type(lua, -2) != LUA_TNUMBER) {
             return luaL_error(lua,
-                              "rofi choices must be a dense 1-based sequence");
+                              "spawn argv must be a dense 1-based sequence");
         }
         const lua_Number numeric_key = lua_tonumber(lua, -2);
         if (!isfinite(numeric_key) || numeric_key < 1 ||
-            numeric_key > (lua_Number)choice_count ||
+            numeric_key > (lua_Number)argc ||
             floor(numeric_key) != numeric_key) {
             return luaL_error(lua,
-                              "rofi choices must be a dense 1-based sequence");
+                              "spawn argv must be a dense 1-based sequence");
         }
         encountered++;
         lua_pop(lua, 1);
     }
-    if (encountered != choice_count) {
-        return luaL_error(lua, "rofi choices must be a dense 1-based sequence");
+    if (encountered != argc) {
+        return luaL_error(lua, "spawn argv must be a dense 1-based sequence");
     }
 
-    for (size_t index = 1; index <= choice_count; index++) {
-        lua_rawgeti(lua, choices_index, (int)index);
+    size_t argv_bytes = 0;
+    for (size_t index = 1; index <= argc; index++) {
+        lua_rawgeti(lua, argv_index, (int)index);
         if (lua_type(lua, -1) != LUA_TSTRING) {
-            return luaL_error(lua, "rofi choice %zu must be a string", index);
+            return luaL_error(lua, "spawn argv entry %zu must be a string",
+                              index);
         }
-        size_t choice_len;
-        const char *choice = luaL_checklstring(lua, -1, &choice_len);
-        if (choice_len == 0 ||
-            !valid_text(choice, choice_len, I3SD_ROFI_CHOICE_BYTES) ||
-            memchr(choice, '\n', choice_len) != NULL ||
-            memchr(choice, '\r', choice_len) != NULL) {
+        size_t argument_len;
+        const char *argument = lua_tolstring(lua, -1, &argument_len);
+        if (argument_len == 0 || argument_len > I3SD_SPAWN_ARG_BYTES ||
+            memchr(argument, '\0', argument_len) != NULL) {
             return luaL_error(lua,
-                              "rofi choice %zu must be one non-empty line "
-                              "of valid UTF-8 up to %u bytes",
-                              index, I3SD_ROFI_CHOICE_BYTES);
+                              "spawn argv entry %zu must be non-empty, "
+                              "NUL-free, and at most %u bytes",
+                              index, I3SD_SPAWN_ARG_BYTES);
         }
+        if (argument_len + 1 > I3SD_SPAWN_ARGV_BYTES - argv_bytes) {
+            return luaL_error(lua, "spawn argv exceeds the %u-byte limit",
+                              I3SD_SPAWN_ARGV_BYTES);
+        }
+        argv_bytes += argument_len + 1;
         lua_pop(lua, 1);
     }
 
-    struct i3sd_buffer input = {0};
-    for (size_t index = 1; index <= choice_count; index++) {
-        lua_rawgeti(lua, choices_index, (int)index);
-        size_t choice_len;
-        const char *choice = lua_tolstring(lua, -1, &choice_len);
-        const bool appended =
-            i3sd_buffer_append(&input, choice, choice_len,
-                               I3SD_ROFI_INPUT_BYTES) &&
-            i3sd_buffer_append_char(&input, '\n', I3SD_ROFI_INPUT_BYTES);
-        lua_pop(lua, 1);
-        if (!appended) {
-            i3sd_buffer_destroy(&input);
-            return luaL_error(lua, "rofi choices exceed the %u-byte limit",
-                              I3SD_ROFI_INPUT_BYTES);
+    lua_getfield(lua, 2, "stdin");
+    size_t input_len = 0;
+    const char *input = "";
+    if (!lua_isnil(lua, -1)) {
+        luaL_checktype(lua, -1, LUA_TSTRING);
+        input = lua_tolstring(lua, -1, &input_len);
+        if (input_len > I3SD_SPAWN_INPUT_BYTES) {
+            return luaL_error(lua, "spawn stdin exceeds the %u-byte limit",
+                              I3SD_SPAWN_INPUT_BYTES);
         }
+    }
+
+    lua_getfield(lua, 2, "stdout_limit");
+    size_t output_limit = I3SD_SPAWN_OUTPUT_BYTES;
+    if (!lua_isnil(lua, -1)) {
+        luaL_checktype(lua, -1, LUA_TNUMBER);
+        const lua_Number requested = lua_tonumber(lua, -1);
+        if (!isfinite(requested) || requested < 1 ||
+            requested > I3SD_SPAWN_OUTPUT_BYTES ||
+            floor(requested) != requested) {
+            return luaL_error(lua, "spawn stdout_limit must be from 1 to %u",
+                              I3SD_SPAWN_OUTPUT_BYTES);
+        }
+        output_limit = (size_t)requested;
     }
 
     struct app *app = block->generation->app;
-    if (app->current != block->generation || block->faulted) {
-        i3sd_buffer_destroy(&input);
-        lua_pushboolean(lua, false);
+    if (app->current != block->generation || block->faulted ||
+        app->spawn.active) {
+        lua_pushnil(lua);
         return 1;
+    }
+
+    char **argv = calloc(argc + 1, sizeof(*argv));
+    if (argv == NULL) {
+        return luaL_error(lua, "out of memory creating spawn argv");
+    }
+    for (size_t index = 1; index <= argc; index++) {
+        lua_rawgeti(lua, argv_index, (int)index);
+        argv[index - 1] = (char *)lua_tostring(lua, -1);
+        lua_pop(lua, 1);
     }
 
     lua_pushvalue(lua, 3);
     const int callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
-    const bool opened =
-        open_rofi_menu(app, block, prompt, input.data, input.len, callback_ref);
-    i3sd_buffer_destroy(&input);
+    uint64_t serial = ++app->next_spawn_serial;
+    if (serial == 0) {
+        serial = ++app->next_spawn_serial;
+    }
+    const bool opened = open_spawn_process(app, block, argv, input, input_len,
+                                           output_limit, callback_ref, serial);
+    free(argv);
     if (!opened) {
         luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
+        lua_pushnil(lua);
+        return 1;
     }
-    lua_pushboolean(lua, opened);
+
+    struct lua_spawn_handle *handle = lua_newuserdata(lua, sizeof(*handle));
+    handle->app = app;
+    handle->serial = serial;
+    luaL_getmetatable(lua, spawn_handle_metatable);
+    lua_setmetatable(lua, -2);
     return 1;
 }
 
@@ -1325,7 +1370,7 @@ static int lua_has_feature(lua_State *lua) {
     bool available =
         strcmp(feature, "collectors") == 0 || strcmp(feature, "inotify") == 0 ||
         strcmp(feature, "psi") == 0 || strcmp(feature, "systemd") == 0 ||
-        strcmp(feature, "power_profiles") == 0 || strcmp(feature, "rofi") == 0;
+        strcmp(feature, "power_profiles") == 0 || strcmp(feature, "spawn") == 0;
     lua_pushboolean(lua, available);
     return 1;
 }
@@ -1343,7 +1388,7 @@ static int lua_features(lua_State *lua) {
     lua_pushboolean(lua, true);
     lua_setfield(lua, -2, "power_profiles");
     lua_pushboolean(lua, true);
-    lua_setfield(lua, -2, "rofi");
+    lua_setfield(lua, -2, "spawn");
     return 1;
 }
 
@@ -1478,7 +1523,7 @@ static void register_lua_api(struct generation *generation) {
         {"after", lua_context_after},
         {"every", lua_context_every},
         {"sample", lua_context_sample},
-        {"rofi", lua_context_rofi},
+        {"spawn", lua_context_spawn},
         {"_watch_systemd_failed", lua_context_watch_systemd_failed},
         {"_watch_power_profiles", lua_context_watch_power_profiles},
         {"_set_power_profile", lua_context_set_power_profile},
@@ -1507,6 +1552,13 @@ static void register_lua_api(struct generation *generation) {
     luaL_newmetatable(lua, power_profiles_handle_metatable);
     lua_newtable(lua);
     lua_pushcfunction(lua, lua_power_profiles_cancel);
+    lua_setfield(lua, -2, "cancel");
+    lua_setfield(lua, -2, "__index");
+    lua_pop(lua, 1);
+
+    luaL_newmetatable(lua, spawn_handle_metatable);
+    lua_newtable(lua);
+    lua_pushcfunction(lua, lua_spawn_cancel);
     lua_setfield(lua, -2, "cancel");
     lua_setfield(lua, -2, "__index");
     lua_pop(lua, 1);
@@ -2233,7 +2285,7 @@ static bool known_power_profile(const struct power_profiles_source *source,
     return false;
 }
 
-static bool write_rofi_input(int fd, const char *input, size_t input_len) {
+static bool write_spawn_input(int fd, const char *input, size_t input_len) {
     size_t offset = 0;
     while (offset < input_len) {
         const ssize_t count = write(fd, input + offset, input_len - offset);
@@ -2248,16 +2300,16 @@ static bool write_rofi_input(int fd, const char *input, size_t input_len) {
     return true;
 }
 
-static bool open_rofi_menu(struct app *app, struct block *block,
-                           const char *prompt, const char *choices,
-                           size_t choices_len, int callback_ref) {
-    if (app->rofi.output_fd >= 0) {
+static bool open_spawn_process(struct app *app, struct block *block,
+                               char *const argv[], const char *input,
+                               size_t input_len, size_t output_limit,
+                               int callback_ref, uint64_t serial) {
+    if (app->spawn.active) {
         return false;
     }
-    /* A private input fd avoids blocking the reactor on a pipe writer and
-       prevents a short-lived rofi process from generating SIGPIPE. */
-    const int input_fd = memfd_create("i3sd-rofi-input", MFD_CLOEXEC);
-    if (input_fd < 0 || !write_rofi_input(input_fd, choices, choices_len) ||
+    /* A private input fd keeps bounded input writes off the child pipe. */
+    const int input_fd = memfd_create("i3sd-spawn-input", MFD_CLOEXEC);
+    if (input_fd < 0 || !write_spawn_input(input_fd, input, input_len) ||
         lseek(input_fd, 0, SEEK_SET) < 0) {
         if (input_fd >= 0) {
             close(input_fd);
@@ -2287,7 +2339,7 @@ static bool open_rofi_menu(struct app *app, struct block *block,
         close(input_fd);
         close(output_pipe[0]);
         close(output_pipe[1]);
-        execlp("rofi", "rofi", "-dmenu", "-p", prompt, NULL);
+        execvp(argv[0], argv);
         _exit(127);
     }
     close(input_fd);
@@ -2299,93 +2351,140 @@ static bool open_rofi_menu(struct app *app, struct block *block,
     }
     struct epoll_event event = {
         .events = EPOLLIN | EPOLLERR | EPOLLHUP,
-        .data.u64 = SOURCE_ROFI,
+        .data.u64 = SOURCE_SPAWN,
     };
     if (epoll_ctl(app->epoll_fd, EPOLL_CTL_ADD, output_pipe[0], &event) < 0) {
         close(output_pipe[0]);
         kill(pid, SIGTERM);
         return false;
     }
-    app->rofi.pid = pid;
-    app->rofi.output_fd = output_pipe[0];
-    app->rofi.block = block;
-    app->rofi.callback_ref = callback_ref;
-    app->rofi.result_len = 0;
+    struct spawned_process *process = &app->spawn;
+    process->pid = pid;
+    process->output_fd = output_pipe[0];
+    process->block = block;
+    process->callback_ref = callback_ref;
+    process->serial = serial;
+    process->output_limit = output_limit;
+    process->wait_status = 0;
+    process->active = true;
+    process->output_closed = false;
+    process->exited = false;
+    process->overflow = false;
+    process->io_error = false;
+    i3sd_buffer_clear(&process->output);
     return true;
 }
 
-static void cancel_rofi_menu(struct app *app,
-                             const struct generation *generation) {
-    struct block *block = app->rofi.block;
-    if (block == NULL || block->generation != generation) {
+static void cancel_spawn_process(struct app *app) {
+    struct spawned_process *process = &app->spawn;
+    if (!process->active) {
         return;
     }
-    if (app->rofi.output_fd >= 0) {
-        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, app->rofi.output_fd, NULL);
-        close(app->rofi.output_fd);
-        app->rofi.output_fd = -1;
+    if (process->output_fd >= 0) {
+        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, process->output_fd, NULL);
+        close(process->output_fd);
+        process->output_fd = -1;
     }
-    if (app->rofi.pid > 0) {
-        kill(app->rofi.pid, SIGTERM);
-        app->rofi.pid = 0;
+    if (process->pid > 0) {
+        kill(process->pid, SIGTERM);
+        process->pid = 0;
     }
-    luaL_unref(generation->lua, LUA_REGISTRYINDEX, app->rofi.callback_ref);
-    app->rofi.block = NULL;
-    app->rofi.callback_ref = LUA_NOREF;
-    app->rofi.result_len = 0;
+    luaL_unref(process->block->generation->lua, LUA_REGISTRYINDEX,
+               process->callback_ref);
+    process->block = NULL;
+    process->callback_ref = LUA_NOREF;
+    process->active = false;
+    i3sd_buffer_clear(&process->output);
 }
 
-static void finish_rofi_menu(struct app *app) {
-    if (app->rofi.output_fd >= 0) {
-        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, app->rofi.output_fd, NULL);
-        close(app->rofi.output_fd);
-        app->rofi.output_fd = -1;
+static void finish_spawn_process(struct app *app) {
+    struct spawned_process *process = &app->spawn;
+    if (!process->active || !process->output_closed || !process->exited) {
+        return;
     }
-    struct block *block = app->rofi.block;
-    const int callback_ref = app->rofi.callback_ref;
-    app->rofi.block = NULL;
-    app->rofi.callback_ref = LUA_NOREF;
 
-    while (app->rofi.result_len > 0 &&
-           (app->rofi.result[app->rofi.result_len - 1] == '\n' ||
-            app->rofi.result[app->rofi.result_len - 1] == '\r')) {
-        app->rofi.result_len--;
+    struct block *block = process->block;
+    lua_State *lua = block->generation->lua;
+    const int callback_ref = process->callback_ref;
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, callback_ref);
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
+    lua_newtable(lua);
+    lua_pushlstring(lua,
+                    process->output.data == NULL ? "" : process->output.data,
+                    process->output.len);
+    lua_setfield(lua, -2, "stdout");
+    const bool exited_normally = WIFEXITED(process->wait_status);
+    const bool success = exited_normally &&
+                         WEXITSTATUS(process->wait_status) == 0 &&
+                         !process->overflow && !process->io_error;
+    lua_pushboolean(lua, success);
+    lua_setfield(lua, -2, "success");
+    lua_pushboolean(lua, process->overflow);
+    lua_setfield(lua, -2, "overflow");
+    lua_pushboolean(lua, process->io_error);
+    lua_setfield(lua, -2, "io_error");
+    if (exited_normally) {
+        lua_pushinteger(lua, WEXITSTATUS(process->wait_status));
+        lua_setfield(lua, -2, "exit_status");
+    } else if (WIFSIGNALED(process->wait_status)) {
+        lua_pushinteger(lua, WTERMSIG(process->wait_status));
+        lua_setfield(lua, -2, "signal");
     }
-    const bool valid_selection =
-        app->rofi.result_len > 0 &&
-        app->rofi.result_len <= I3SD_ROFI_CHOICE_BYTES &&
-        valid_text(app->rofi.result, app->rofi.result_len,
-                   I3SD_ROFI_CHOICE_BYTES) &&
-        memchr(app->rofi.result, '\n', app->rofi.result_len) == NULL &&
-        memchr(app->rofi.result, '\r', app->rofi.result_len) == NULL;
 
-    if (block != NULL) {
-        lua_State *lua = block->generation->lua;
-        if (app->current == block->generation && !block->faulted) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, callback_ref);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
-            if (valid_selection) {
-                lua_pushlstring(lua, app->rofi.result, app->rofi.result_len);
-            } else {
-                lua_pushnil(lua);
-            }
-            if (lua_pcall(lua, 2, 0, 0) != 0) {
-                log_lua_error(block, "rofi callback");
-                fault_block(block);
-            }
+    /* Release the slot before the callback so it may start another child. */
+    process->block = NULL;
+    process->callback_ref = LUA_NOREF;
+    process->active = false;
+    i3sd_buffer_clear(&process->output);
+    if (app->current == block->generation && !block->faulted) {
+        if (lua_pcall(lua, 2, 0, 0) != 0) {
+            log_lua_error(block, "spawn callback");
+            fault_block(block);
         }
-        luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
+    } else {
+        lua_pop(lua, 3);
     }
-    app->rofi.result_len = 0;
+    luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
 }
 
-static void read_rofi_menu(struct app *app) {
-    while (app->rofi.result_len < I3SD_ROFI_CHOICE_BYTES + 1) {
-        ssize_t count =
-            read(app->rofi.output_fd, app->rofi.result + app->rofi.result_len,
-                 I3SD_ROFI_CHOICE_BYTES + 1 - app->rofi.result_len);
+static void close_spawn_output(struct app *app, bool io_error) {
+    struct spawned_process *process = &app->spawn;
+    if (process->output_fd >= 0) {
+        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, process->output_fd, NULL);
+        close(process->output_fd);
+        process->output_fd = -1;
+    }
+    process->output_closed = true;
+    process->io_error = process->io_error || io_error;
+    if (io_error && process->pid > 0) {
+        kill(process->pid, SIGTERM);
+    }
+    finish_spawn_process(app);
+}
+
+static void read_spawn_process(struct app *app) {
+    struct spawned_process *process = &app->spawn;
+    if (!process->active || process->output_fd < 0) {
+        return;
+    }
+    char bytes[4096];
+    size_t consumed = 0;
+    while (consumed < I3SD_SPAWN_READ_BUDGET) {
+        const ssize_t count = read(process->output_fd, bytes, sizeof(bytes));
         if (count > 0) {
-            app->rofi.result_len += (size_t)count;
+            consumed += (size_t)count;
+            const size_t available =
+                process->output_limit - process->output.len;
+            const size_t retained =
+                (size_t)count < available ? (size_t)count : available;
+            if (retained > 0 &&
+                !i3sd_buffer_append(&process->output, bytes, retained,
+                                    process->output_limit)) {
+                process->overflow = true;
+            }
+            if ((size_t)count > retained) {
+                process->overflow = true;
+            }
             continue;
         }
         if (count < 0 && errno == EINTR) {
@@ -2394,18 +2493,20 @@ static void read_rofi_menu(struct app *app) {
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return;
         }
-        finish_rofi_menu(app);
+        close_spawn_output(app, count < 0);
         return;
     }
-    finish_rofi_menu(app);
 }
 
 static void generation_destroy(struct generation *generation) {
     if (generation == NULL) {
         return;
     }
-    /* A popup callback is owned by the generation's Lua registry. */
-    cancel_rofi_menu(generation->app, generation);
+    /* Spawn callbacks and child lifetime are owned by their Lua generation. */
+    if (generation->app->spawn.active &&
+        generation->app->spawn.block->generation == generation) {
+        cancel_spawn_process(generation->app);
+    }
     struct logical_timer *timer = generation->timers;
     while (timer != NULL) {
         if (timer->timer.active) {
@@ -2524,8 +2625,9 @@ static void fault_block(struct block *block) {
     }
     block->faulted = true;
     struct generation *generation = block->generation;
-    if (generation->app->rofi.block == block) {
-        cancel_rofi_menu(generation->app, generation);
+    if (generation->app->spawn.active &&
+        generation->app->spawn.block == block) {
+        cancel_spawn_process(generation->app);
     }
     for (struct logical_timer *timer = generation->timers; timer != NULL;
          timer = timer->next) {
@@ -2852,10 +2954,14 @@ static void handle_signals(struct app *app) {
                 break;
             case SIGCHLD: {
                 pid_t child;
+                int status;
                 do {
-                    child = waitpid(-1, NULL, WNOHANG);
-                    if (child == app->rofi.pid) {
-                        app->rofi.pid = 0;
+                    child = waitpid(-1, &status, WNOHANG);
+                    if (app->spawn.active && child == app->spawn.pid) {
+                        app->spawn.pid = 0;
+                        app->spawn.wait_status = status;
+                        app->spawn.exited = true;
+                        finish_spawn_process(app);
                     }
                 } while (child > 0);
                 break;
@@ -3023,8 +3129,8 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
         .app = app,
         .registered_fd = -1,
     };
-    app->rofi.output_fd = -1;
-    app->rofi.callback_ref = LUA_NOREF;
+    app->spawn.output_fd = -1;
+    app->spawn.callback_ref = LUA_NOREF;
     return add_epoll_fd(app, app->signal_fd, EPOLLIN, SOURCE_SIGNAL) &&
            add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
                         SOURCE_STDIN) &&
@@ -3073,8 +3179,8 @@ static void run_event_loop(struct app *app) {
                 process_power_profiles_source(&app->power_profiles,
                                               monotonic_now_ns());
                 break;
-            case SOURCE_ROFI:
-                read_rofi_menu(app);
+            case SOURCE_SPAWN:
+                read_spawn_process(app);
                 break;
             default:
                 break;
@@ -3119,13 +3225,10 @@ static void app_destroy(struct app *app) {
     if (app->power_profiles.bus != NULL) {
         close_power_profiles_source(&app->power_profiles);
     }
-    if (app->rofi.output_fd >= 0) {
-        close(app->rofi.output_fd);
+    if (app->spawn.active) {
+        cancel_spawn_process(app);
     }
-    if (app->rofi.pid > 0) {
-        kill(app->rofi.pid, SIGTERM);
-        waitpid(app->rofi.pid, NULL, 0);
-    }
+    i3sd_buffer_destroy(&app->spawn.output);
     i3sd_timer_heap_destroy(&app->timer_heap);
     i3sd_output_destroy(&app->output);
     i3sd_click_framer_destroy(&app->click_framer);

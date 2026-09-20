@@ -74,7 +74,7 @@ test(
     args: [meson.current_build_dir() / 'i3sd', meson.current_source_dir()],
 )
 test(
-    'rofi-callback',
+    'spawn-callback',
     find_program('tests/test_rofi.sh'),
     args: [
         meson.current_build_dir() / 'i3sd',

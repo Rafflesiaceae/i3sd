@@ -16,12 +16,13 @@ block {
     order = 2,
     interval = 60,
     init = function(ctx)
-        -- Staging validates rofi requests without starting external programs.
-        assert(not ctx:rofi({
-            prompt = "Test action",
-            choices = { "first", "second" },
+        -- Staging validates spawn requests without starting external programs.
+        assert(ctx:spawn({
+            argv = { "true" },
+            stdin = "ignored",
+            stdout_limit = 16,
         }, function(_menu_ctx, _selected)
-        end))
+        end) == nil)
         ctx:after(10, function(inner_ctx)
             inner_ctx:set { full_text = "late" }
         end)
