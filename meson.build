@@ -52,6 +52,7 @@ endif
 
 executable(
     'i3sd',
+    'src/collectors.c',
     'src/dbus.c',
     'src/main.c',
     'src/pipewire.c',

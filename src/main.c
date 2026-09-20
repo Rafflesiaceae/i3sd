@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "collectors.h"
 #include "config.h"
 #include "dbus.h"
 #include "i3sd/buffer.h"
@@ -19,7 +20,6 @@
 #include <xxhash.h>
 #include <yyjson.h>
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -38,8 +38,6 @@
 #include <sys/random.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
-#include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -88,8 +86,6 @@ static const char power_profiles_handle_metatable[] =
 static const char spawn_handle_metatable[] = "i3sd.spawn_handle";
 
 static bool make_nonblocking(int fd);
-static void push_error(lua_State *lua, const char *code, const char *message,
-                       const char *source, int error_number);
 static void push_uint64(lua_State *lua, uint64_t value);
 static void push_int64(lua_State *lua, int64_t value);
 
@@ -808,23 +804,6 @@ static int lua_context_set_power_profile(lua_State *lua) {
     return 1;
 }
 
-static void push_error(lua_State *lua, const char *code, const char *message,
-                       const char *source, int error_number) {
-    lua_newtable(lua);
-    lua_pushstring(lua, code);
-    lua_setfield(lua, -2, "code");
-    lua_pushstring(lua, message);
-    lua_setfield(lua, -2, "message");
-    if (source != NULL) {
-        lua_pushstring(lua, source);
-        lua_setfield(lua, -2, "source");
-    }
-    if (error_number != 0) {
-        lua_pushinteger(lua, error_number);
-        lua_setfield(lua, -2, "errno");
-    }
-}
-
 static void push_uint64(lua_State *lua, uint64_t value) {
     struct generation *generation;
     lua_getfield(lua, LUA_REGISTRYINDEX, "i3sd.current_generation");
@@ -851,313 +830,11 @@ static void push_int64(lua_State *lua, int64_t value) {
     }
 }
 
-static void push_snapshot_header(lua_State *lua, const char *source_id) {
-    lua_newtable(lua);
-    push_uint64(lua, monotonic_now_ns());
-    lua_setfield(lua, -2, "timestamp_ns");
-    lua_pushstring(lua, source_id);
-    lua_setfield(lua, -2, "source_id");
-    push_uint64(lua, 1);
-    lua_setfield(lua, -2, "continuity");
-}
-
-static bool option_boolean(lua_State *lua, int table, const char *name,
-                           bool fallback) {
-    lua_getfield(lua, table, name);
-    if (lua_isnil(lua, -1)) {
-        lua_pop(lua, 1);
-        return fallback;
-    }
-    luaL_checktype(lua, -1, LUA_TBOOLEAN);
-    bool value = lua_toboolean(lua, -1);
-    lua_pop(lua, 1);
-    return value;
-}
-
-static int sample_cpu(lua_State *lua, int options) {
-    static const char *const fields[] = {"per_cpu"};
-    check_strict_table(lua, options, fields, 1);
-    const bool per_cpu = option_boolean(lua, options, "per_cpu", false);
-    FILE *file = fopen("/proc/stat", "re");
-    if (file == NULL) {
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(errno), "cpu", errno);
-        return 2;
-    }
-    push_snapshot_header(lua, "proc-stat");
-    lua_newtable(lua);
-    int cpu_index = 1;
-    char line[512];
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char id[32];
-        unsigned long long values[10] = {0};
-        const int parsed = sscanf(
-            line, "%31s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu", id,
-            &values[0], &values[1], &values[2], &values[3], &values[4],
-            &values[5], &values[6], &values[7], &values[8], &values[9]);
-        if (parsed != 11 || strncmp(id, "cpu", 3) != 0) {
-            if (strncmp(line, "cpu", 3) != 0) {
-                break;
-            }
-            continue;
-        }
-        lua_newtable(lua);
-        lua_pushstring(lua, id);
-        lua_setfield(lua, -2, "id");
-        static const char *const names[10] = {
-            "user", "nice",    "system", "idle",  "iowait",
-            "irq",  "softirq", "steal",  "guest", "guest_nice",
-        };
-        for (size_t index = 0; index < 10; index++) {
-            push_uint64(lua, values[index]);
-            lua_setfield(lua, -2, names[index]);
-        }
-        if (strcmp(id, "cpu") == 0) {
-            lua_setfield(lua, -3, "aggregate");
-        } else if (per_cpu) {
-            lua_rawseti(lua, -2, cpu_index++);
-        } else {
-            lua_pop(lua, 1);
-        }
-    }
-    fclose(file);
-    if (per_cpu) {
-        lua_setfield(lua, -2, "cpus");
-    } else {
-        lua_pop(lua, 1);
-    }
-    return 1;
-}
-
-static int sample_load(lua_State *lua, int options) {
-    check_strict_table(lua, options, NULL, 0);
-    struct sysinfo information;
-    if (sysinfo(&information) < 0) {
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(errno), "load", errno);
-        return 2;
-    }
-    push_snapshot_header(lua, "sysinfo-load");
-    const double scale = 1.0 / (double)(1U << SI_LOAD_SHIFT);
-    lua_pushnumber(lua, information.loads[0] * scale);
-    lua_setfield(lua, -2, "load1");
-    lua_pushnumber(lua, information.loads[1] * scale);
-    lua_setfield(lua, -2, "load5");
-    lua_pushnumber(lua, information.loads[2] * scale);
-    lua_setfield(lua, -2, "load15");
-    const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    lua_pushinteger(lua, cpus > 0 ? cpus : 1);
-    lua_setfield(lua, -2, "online_cpus");
-    return 1;
-}
-
-static int sample_memory(lua_State *lua, int options) {
-    check_strict_table(lua, options, NULL, 0);
-    FILE *file = fopen("/proc/meminfo", "re");
-    if (file == NULL) {
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(errno), "memory", errno);
-        return 2;
-    }
-    uint64_t total = 0, available = 0, swap_total = 0, swap_free = 0;
-    char key[64], unit[16];
-    unsigned long long value;
-    while (fscanf(file, "%63[^:]: %llu %15s\n", key, &value, unit) == 3) {
-        const uint64_t bytes = value * 1024ULL;
-        if (strcmp(key, "MemTotal") == 0) {
-            total = bytes;
-        } else if (strcmp(key, "MemAvailable") == 0) {
-            available = bytes;
-        } else if (strcmp(key, "SwapTotal") == 0) {
-            swap_total = bytes;
-        } else if (strcmp(key, "SwapFree") == 0) {
-            swap_free = bytes;
-        }
-    }
-    fclose(file);
-    if (total == 0 || available == 0) {
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", "incomplete /proc/meminfo", "memory", 0);
-        return 2;
-    }
-    push_snapshot_header(lua, "proc-meminfo");
-    push_uint64(lua, total);
-    lua_setfield(lua, -2, "mem_total");
-    push_uint64(lua, available);
-    lua_setfield(lua, -2, "mem_available");
-    push_uint64(lua, swap_total);
-    lua_setfield(lua, -2, "swap_total");
-    push_uint64(lua, swap_free);
-    lua_setfield(lua, -2, "swap_free");
-    return 1;
-}
-
-static int sample_filesystem(lua_State *lua, int options) {
-    static const char *const fields[] = {"path"};
-    check_strict_table(lua, options, fields, 1);
-    lua_getfield(lua, options, "path");
-    size_t path_len;
-    const char *path = luaL_checklstring(lua, -1, &path_len);
-    if (!valid_text(path, path_len, PATH_MAX)) {
-        return luaL_error(lua, "path must be valid, NUL-free UTF-8");
-    }
-    struct statvfs status;
-    if (statvfs(path, &status) < 0) {
-        const int saved_errno = errno;
-        lua_pop(lua, 1);
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(saved_errno), "filesystem",
-                   saved_errno);
-        return 2;
-    }
-    push_snapshot_header(lua, path);
-    lua_pushvalue(lua, -2);
-    lua_setfield(lua, -2, "path");
-    push_uint64(lua, (uint64_t)status.f_blocks * status.f_frsize);
-    lua_setfield(lua, -2, "total_bytes");
-    push_uint64(lua, (uint64_t)status.f_bfree * status.f_frsize);
-    lua_setfield(lua, -2, "free_bytes");
-    push_uint64(lua, (uint64_t)status.f_bavail * status.f_frsize);
-    lua_setfield(lua, -2, "available_bytes");
-    lua_pushboolean(lua, (status.f_flag & ST_RDONLY) != 0);
-    lua_setfield(lua, -2, "readonly");
-    lua_remove(lua, -2);
-    return 1;
-}
-
-static int sample_time(lua_State *lua, int options) {
-    check_strict_table(lua, options, NULL, 0);
-    struct timespec realtime, monotonic, boottime;
-    if (clock_gettime(CLOCK_REALTIME, &realtime) < 0 ||
-        clock_gettime(CLOCK_MONOTONIC, &monotonic) < 0 ||
-        clock_gettime(CLOCK_BOOTTIME, &boottime) < 0) {
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(errno), "time", errno);
-        return 2;
-    }
-    push_snapshot_header(lua, "linux-clocks");
-#define SET_CLOCK(name, value)                                                 \
-    do {                                                                       \
-        push_uint64(lua, (uint64_t)(value).tv_sec * 1000000000ULL +            \
-                             (uint64_t)(value).tv_nsec);                       \
-        lua_setfield(lua, -2, (name));                                         \
-    } while (0)
-    SET_CLOCK("realtime_ns", realtime);
-    SET_CLOCK("monotonic_ns", monotonic);
-    SET_CLOCK("boottime_ns", boottime);
-#undef SET_CLOCK
-    return 1;
-}
-
-static int sample_psi(lua_State *lua, int options) {
-    static const char *const fields[] = {"resource"};
-    check_strict_table(lua, options, fields, 1);
-    lua_getfield(lua, options, "resource");
-    const char *resource = luaL_checkstring(lua, -1);
-    if (strcmp(resource, "cpu") != 0 && strcmp(resource, "memory") != 0 &&
-        strcmp(resource, "io") != 0) {
-        return luaL_error(lua, "PSI resource must be cpu, memory, or io");
-    }
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/pressure/%s", resource);
-    FILE *file = fopen(path, "re");
-    if (file == NULL) {
-        const int saved_errno = errno;
-        lua_pop(lua, 1);
-        lua_pushnil(lua);
-        push_error(lua, saved_errno == ENOENT ? "unsupported" : "unavailable",
-                   strerror(saved_errno), "psi", saved_errno);
-        return 2;
-    }
-    push_snapshot_header(lua, path);
-    char line[256];
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char mode[16];
-        double avg10, avg60, avg300;
-        unsigned long long total;
-        if (sscanf(line, "%15s avg10=%lf avg60=%lf avg300=%lf total=%llu", mode,
-                   &avg10, &avg60, &avg300, &total) != 5) {
-            continue;
-        }
-        lua_newtable(lua);
-        lua_pushnumber(lua, avg10);
-        lua_setfield(lua, -2, "avg10");
-        lua_pushnumber(lua, avg60);
-        lua_setfield(lua, -2, "avg60");
-        lua_pushnumber(lua, avg300);
-        lua_setfield(lua, -2, "avg300");
-        push_uint64(lua, total);
-        lua_setfield(lua, -2, "total_us");
-        lua_setfield(lua, -2, mode);
-    }
-    fclose(file);
-    lua_remove(lua, -2);
-    return 1;
-}
-
-static int sample_file_stat(lua_State *lua, int options) {
-    static const char *const fields[] = {"path", "follow"};
-    check_strict_table(lua, options, fields, 2);
-    lua_getfield(lua, options, "path");
-    size_t path_len;
-    const char *path = luaL_checklstring(lua, -1, &path_len);
-    if (!valid_text(path, path_len, PATH_MAX)) {
-        return luaL_error(lua, "path must be valid, NUL-free UTF-8");
-    }
-    const bool follow = option_boolean(lua, options, "follow", true);
-    struct stat status;
-    const int result = follow ? stat(path, &status) : lstat(path, &status);
-    if (result < 0 && errno != ENOENT && errno != ENOTDIR) {
-        const int saved_errno = errno;
-        lua_pop(lua, 1);
-        lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(saved_errno), "file_stat",
-                   saved_errno);
-        return 2;
-    }
-    push_snapshot_header(lua, path);
-    lua_pushvalue(lua, -2);
-    lua_setfield(lua, -2, "path");
-    lua_pushboolean(lua, result == 0);
-    lua_setfield(lua, -2, "exists");
-    if (result == 0) {
-        if (status.st_size < 0) {
-            lua_pop(lua, 2);
-            lua_pushnil(lua);
-            push_error(lua, "too_large", "negative file size is unsupported",
-                       "file_stat", 0);
-            return 2;
-        }
-        push_uint64(lua, (uint64_t)status.st_size);
-        lua_setfield(lua, -2, "size_bytes");
-        push_uint64(lua, status.st_dev);
-        lua_setfield(lua, -2, "device");
-        push_uint64(lua, status.st_ino);
-        lua_setfield(lua, -2, "inode");
-        if (status.st_mtim.tv_sec > INT64_MAX / 1000000000LL ||
-            (status.st_mtim.tv_sec == INT64_MAX / 1000000000LL &&
-             status.st_mtim.tv_nsec > INT64_MAX % 1000000000LL) ||
-            status.st_mtim.tv_sec < INT64_MIN / 1000000000LL) {
-            lua_pop(lua, 2);
-            lua_pushnil(lua);
-            push_error(lua, "too_large", "mtime is outside signed nanoseconds",
-                       "file_stat", 0);
-            return 2;
-        }
-        const int64_t mtime_ns =
-            status.st_mtim.tv_sec * 1000000000LL + status.st_mtim.tv_nsec;
-        push_int64(lua, mtime_ns);
-        lua_setfield(lua, -2, "mtime_ns");
-        const char *kind = S_ISREG(status.st_mode)   ? "regular"
-                           : S_ISDIR(status.st_mode) ? "directory"
-                           : S_ISLNK(status.st_mode) ? "symlink"
-                                                     : "other";
-        lua_pushstring(lua, kind);
-        lua_setfield(lua, -2, "kind");
-    }
-    lua_remove(lua, -2);
-    return 1;
-}
+static const struct i3sd_collector_host collector_host = {
+    .now_ns = monotonic_now_ns,
+    .push_uint64 = push_uint64,
+    .push_int64 = push_int64,
+};
 
 static int lua_context_sample(lua_State *lua) {
     check_context(lua, 1);
@@ -1169,24 +846,7 @@ static int lua_context_sample(lua_State *lua) {
         lua_pushvalue(lua, 3);
     }
     const int options = lua_gettop(lua);
-    int result;
-    if (strcmp(kind, "cpu") == 0) {
-        result = sample_cpu(lua, options);
-    } else if (strcmp(kind, "load") == 0) {
-        result = sample_load(lua, options);
-    } else if (strcmp(kind, "memory") == 0) {
-        result = sample_memory(lua, options);
-    } else if (strcmp(kind, "filesystem") == 0) {
-        result = sample_filesystem(lua, options);
-    } else if (strcmp(kind, "time") == 0) {
-        result = sample_time(lua, options);
-    } else if (strcmp(kind, "psi") == 0) {
-        result = sample_psi(lua, options);
-    } else if (strcmp(kind, "file_stat") == 0) {
-        result = sample_file_stat(lua, options);
-    } else {
-        return luaL_error(lua, "unknown collector '%s'", kind);
-    }
+    const int result = i3sd_collect(lua, kind, options, &collector_host);
     lua_remove(lua, options);
     return result;
 }
