@@ -7,11 +7,14 @@
 #include "i3sd/output.h"
 #include "i3sd/timer.h"
 #include "i3sd/utf8.h"
+#include "power_profiles.h"
+#include "runtime.h"
+#include "spawn.h"
+#include "systemd.h"
 
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
-#include <systemd/sd-bus.h>
 #include <xxhash.h>
 #include <yyjson.h>
 
@@ -31,7 +34,6 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
-#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
@@ -41,8 +43,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define I3SD_MAX_BLOCKS 256U
-#define I3SD_MAX_TIMERS 4096U
 #define I3SD_MAX_TEXT 6144U
 #define I3SD_MAX_BLOCK_JSON 7168U
 #define I3SD_MAX_CONFIG (1024U * 1024U)
@@ -55,197 +55,6 @@
 #define I3SD_SPAWN_ARGV_BYTES (64U * 1024U)
 #define I3SD_SPAWN_INPUT_BYTES (64U * 1024U)
 #define I3SD_SPAWN_OUTPUT_BYTES (64U * 1024U)
-#define I3SD_SPAWN_READ_BUDGET (64U * 1024U)
-
-enum source_cookie {
-    SOURCE_SIGNAL = 1,
-    SOURCE_STDIN = 2,
-    SOURCE_STDOUT = 3,
-    SOURCE_INOTIFY = 4,
-    SOURCE_SYSTEM_BUS = 5,
-    SOURCE_USER_BUS = 6,
-    SOURCE_POWER_PROFILES = 7,
-    SOURCE_SPAWN = 8,
-    SOURCE_FIXED_MAX = SOURCE_SPAWN,
-};
-
-struct app;
-struct generation;
-struct block;
-struct systemd_subscription;
-struct power_profiles_subscription;
-
-#define I3SD_POWER_PROFILE_LIMIT 16U
-#define I3SD_POWER_PROFILE_NAME_LIMIT 63U
-
-enum systemd_scope {
-    SYSTEMD_SCOPE_SYSTEM,
-    SYSTEMD_SCOPE_USER,
-    SYSTEMD_SCOPE_BOTH,
-};
-
-struct systemd_bus {
-    struct app *app;
-    sd_bus *bus;
-    sd_bus_slot *match_slot;
-    uint64_t cookie;
-    uint64_t retry_deadline_ns;
-    uint32_t failed_count;
-    int registered_fd;
-    uint32_t registered_events;
-    enum systemd_scope scope;
-    bool count_valid;
-    bool query_inflight;
-    bool subscribe_inflight;
-};
-
-struct block_state {
-    char *full_text;
-    char *short_text;
-    char *color;
-    char *background;
-    char *border;
-    char *min_width_string;
-    int64_t min_width_integer;
-    char *align;
-    char *markup;
-    int border_top;
-    int border_right;
-    int border_bottom;
-    int border_left;
-    bool min_width_is_string;
-    bool min_width_present;
-    bool urgent;
-    bool visible;
-};
-
-struct logical_timer {
-    struct i3sd_timer timer;
-    struct logical_timer *next;
-    struct block *block;
-    int callback_ref;
-    uint64_t delay_ns;
-    bool cancelled;
-};
-
-struct systemd_subscription {
-    struct systemd_subscription *next;
-    struct block *block;
-    int callback_ref;
-    enum systemd_scope scope;
-    bool cancelled;
-};
-
-struct power_profiles_subscription {
-    struct power_profiles_subscription *next;
-    struct block *block;
-    int callback_ref;
-    bool cancelled;
-};
-
-struct power_profiles_source {
-    struct app *app;
-    sd_bus *bus;
-    sd_bus_slot *match_slot;
-    uint64_t retry_deadline_ns;
-    char active[I3SD_POWER_PROFILE_NAME_LIMIT + 1];
-    char profiles[I3SD_POWER_PROFILE_LIMIT][I3SD_POWER_PROFILE_NAME_LIMIT + 1];
-    size_t profile_count;
-    int registered_fd;
-    uint32_t registered_events;
-    bool active_valid;
-    bool profiles_valid;
-    bool active_query_inflight;
-    bool profiles_query_inflight;
-};
-
-struct spawned_process {
-    pid_t pid;
-    int output_fd;
-    struct block *block;
-    int callback_ref;
-    uint64_t serial;
-    size_t output_limit;
-    int wait_status;
-    struct i3sd_buffer output;
-    bool active;
-    bool output_closed;
-    bool exited;
-    bool overflow;
-    bool io_error;
-};
-
-struct block {
-    struct generation *generation;
-    char *name;
-    char *key;
-    bool has_key;
-    char token[33];
-    int order;
-    size_t declaration_order;
-    double interval;
-    int init_ref;
-    int update_ref;
-    int click_ref;
-    int context_ref;
-    bool faulted;
-    struct block_state state;
-    struct i3sd_buffer fragment;
-};
-
-struct generation {
-    struct app *app;
-    lua_State *lua;
-    struct block *blocks[I3SD_MAX_BLOCKS];
-    struct block *ordered[I3SD_MAX_BLOCKS];
-    size_t block_count;
-    struct logical_timer *timers;
-    struct systemd_subscription *systemd_subscriptions;
-    struct power_profiles_subscription *power_profiles_subscriptions;
-    struct i3sd_dbus_generation *dbus;
-    size_t timer_count;
-    size_t subscription_count;
-    int push_uint64_ref;
-    int push_int64_ref;
-    bool staging;
-};
-
-struct identity {
-    char *name;
-    char *key;
-    bool has_key;
-    char token[33];
-};
-
-struct app {
-    int epoll_fd;
-    int signal_fd;
-    int inotify_fd;
-    int config_watch;
-    char *config_path;
-    char *config_dir;
-    char *config_base;
-    struct generation *current;
-    struct i3sd_timer_heap timer_heap;
-    struct i3sd_output output;
-    struct i3sd_click_framer click_framer;
-    struct systemd_bus systemd_buses[2];
-    struct power_profiles_source power_profiles;
-    struct i3sd_dbus_runtime *dbus;
-    struct spawned_process spawn;
-    uint64_t next_spawn_serial;
-    struct i3sd_buffer frame;
-    struct identity identities[4096];
-    size_t identity_count;
-    uint64_t next_registration_cookie;
-    size_t prelude_offset;
-    uint64_t last_render_ns;
-    bool stdout_registered;
-    bool render_dirty;
-    bool reload_dirty;
-    bool running;
-    bool debug;
-};
 
 struct lua_context {
     struct block *block;
@@ -277,15 +86,6 @@ static const char power_profiles_handle_metatable[] =
     "i3sd.power_profiles_handle";
 static const char spawn_handle_metatable[] = "i3sd.spawn_handle";
 
-static void fault_block(struct block *block);
-static bool open_spawn_process(struct app *app, struct block *block,
-                               char *const argv[], const char *input,
-                               size_t input_len, size_t output_limit,
-                               int callback_ref, uint64_t serial);
-static void cancel_spawn_process(struct app *app);
-static bool set_power_profile(struct app *app, const char *profile);
-static bool known_power_profile(const struct power_profiles_source *source,
-                                const char *profile);
 static bool make_nonblocking(int fd);
 static void push_error(lua_State *lua, const char *code, const char *message,
                        const char *source, int error_number);
@@ -311,7 +111,7 @@ static char *copy_bytes(const char *value, size_t len) {
     return copy;
 }
 
-static void log_lua_error(struct block *block, const char *phase) {
+void i3sd_log_lua_error(struct block *block, const char *phase) {
     const char *message = lua_tostring(block->generation->lua, -1);
     fprintf(stderr, "i3sd: block %s %s failed: %s\n", block->name, phase,
             message == NULL ? "unknown Lua error" : message);
@@ -837,7 +637,7 @@ static int lua_spawn_cancel(lua_State *lua) {
         luaL_checkudata(lua, 1, spawn_handle_metatable);
     if (handle->app->spawn.active &&
         handle->app->spawn.serial == handle->serial) {
-        cancel_spawn_process(handle->app);
+        i3sd_spawn_cancel(handle->app);
     }
     return 0;
 }
@@ -957,8 +757,8 @@ static int lua_context_spawn(lua_State *lua) {
     if (serial == 0) {
         serial = ++app->next_spawn_serial;
     }
-    const bool opened = open_spawn_process(app, block, argv, input, input_len,
-                                           output_limit, callback_ref, serial);
+    const bool opened = i3sd_spawn_open(app, block, argv, input, input_len,
+                                        output_limit, callback_ref, serial);
     free(argv);
     if (!opened) {
         luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
@@ -987,9 +787,10 @@ static int lua_context_set_power_profile(lua_State *lua) {
     }
     struct app *app = block->generation->app;
     const bool current = app->current == block->generation && !block->faulted;
-    const bool accepted = current && app->power_profiles.profiles_valid &&
-                          known_power_profile(&app->power_profiles, profile) &&
-                          set_power_profile(app, profile);
+    const bool accepted =
+        current && app->power_profiles.profiles_valid &&
+        i3sd_power_profile_known(&app->power_profiles, profile) &&
+        i3sd_power_profile_set(app, profile);
     lua_pushboolean(lua, accepted);
     return 1;
 }
@@ -1512,7 +1313,7 @@ static bool call_block_ref(struct block *block, int reference,
         lua_insert(lua, -(extra_arguments + 1));
     }
     if (lua_pcall(lua, 1 + extra_arguments, 0, 0) != 0) {
-        log_lua_error(block, phase);
+        i3sd_log_lua_error(block, phase);
         return false;
     }
     return true;
@@ -1541,10 +1342,10 @@ static bool dbus_owner_active(void *owner) {
            block->generation->app->current == block->generation;
 }
 
-static void dbus_fault_owner(void *owner) { fault_block(owner); }
+static void dbus_fault_owner(void *owner) { i3sd_fault_block(owner); }
 
 static void dbus_log_lua_error(void *owner, const char *phase) {
-    log_lua_error(owner, phase);
+    i3sd_log_lua_error(owner, phase);
 }
 
 static const struct i3sd_dbus_host dbus_host = {
@@ -1729,818 +1530,6 @@ static void configure_lua_path(struct generation *generation) {
     lua_pop(lua, 2);
 }
 
-static bool systemd_scope_uses(enum systemd_scope subscription_scope,
-                               enum systemd_scope bus_scope) {
-    return subscription_scope == SYSTEMD_SCOPE_BOTH ||
-           subscription_scope == bus_scope;
-}
-
-static bool systemd_bus_needed(const struct app *app,
-                               enum systemd_scope scope) {
-    if (app->current == NULL) {
-        return false;
-    }
-    for (struct systemd_subscription *subscription =
-             app->current->systemd_subscriptions;
-         subscription != NULL; subscription = subscription->next) {
-        if (!subscription->cancelled &&
-            systemd_scope_uses(subscription->scope, scope)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void notify_systemd_subscribers(struct app *app) {
-    struct generation *generation = app->current;
-    if (generation == NULL || generation->staging) {
-        return;
-    }
-    struct systemd_bus *system_bus = &app->systemd_buses[0];
-    struct systemd_bus *user_bus = &app->systemd_buses[1];
-    for (struct systemd_subscription *subscription =
-             generation->systemd_subscriptions;
-         subscription != NULL; subscription = subscription->next) {
-        struct block *block = subscription->block;
-        if (subscription->cancelled || block->faulted) {
-            continue;
-        }
-        if ((systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_SYSTEM) &&
-             !system_bus->count_valid) ||
-            (systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_USER) &&
-             !user_bus->count_valid)) {
-            continue;
-        }
-
-        uint32_t total = 0;
-        lua_State *lua = generation->lua;
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, subscription->callback_ref);
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
-        lua_newtable(lua);
-        if (systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_SYSTEM)) {
-            total += system_bus->failed_count;
-            lua_pushinteger(lua, system_bus->failed_count);
-            lua_setfield(lua, -2, "system_count");
-        }
-        if (systemd_scope_uses(subscription->scope, SYSTEMD_SCOPE_USER)) {
-            total += user_bus->failed_count;
-            lua_pushinteger(lua, user_bus->failed_count);
-            lua_setfield(lua, -2, "user_count");
-        }
-        lua_pushinteger(lua, total);
-        lua_setfield(lua, -2, "count");
-        if (lua_pcall(lua, 2, 0, 0) != 0) {
-            log_lua_error(block, "systemd event");
-            fault_block(block);
-        }
-    }
-}
-
-static int systemd_snapshot_reply(sd_bus_message *message, void *userdata,
-                                  sd_bus_error *ret_error) {
-    (void)ret_error;
-    struct systemd_bus *source = userdata;
-    source->query_inflight = false;
-    if (sd_bus_message_is_method_error(message, NULL)) {
-        source->count_valid = false;
-        return 0;
-    }
-    uint32_t count;
-    int result =
-        sd_bus_message_enter_container(message, SD_BUS_TYPE_VARIANT, "u");
-    if (result >= 0) {
-        result = sd_bus_message_read(message, "u", &count);
-    }
-    if (result < 0) {
-        source->count_valid = false;
-        return 0;
-    }
-    const bool changed = !source->count_valid || source->failed_count != count;
-    source->failed_count = count;
-    source->count_valid = true;
-    if (changed) {
-        notify_systemd_subscribers(source->app);
-    }
-    return 0;
-}
-
-static void request_systemd_snapshot(struct systemd_bus *source) {
-    if (source->bus == NULL || source->query_inflight) {
-        return;
-    }
-    int result = sd_bus_call_method_async(
-        source->bus, NULL, "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1", "org.freedesktop.DBus.Properties", "Get",
-        systemd_snapshot_reply, source, "ss",
-        "org.freedesktop.systemd1.Manager", "NFailedUnits");
-    if (result >= 0) {
-        source->query_inflight = true;
-    }
-}
-
-static int systemd_property_changed(sd_bus_message *message, void *userdata,
-                                    sd_bus_error *ret_error) {
-    (void)message;
-    (void)ret_error;
-    request_systemd_snapshot(userdata);
-    return 0;
-}
-
-static int systemd_subscribe_reply(sd_bus_message *message, void *userdata,
-                                   sd_bus_error *ret_error) {
-    (void)ret_error;
-    struct systemd_bus *source = userdata;
-    source->subscribe_inflight = false;
-    if (sd_bus_message_is_method_error(message, NULL)) {
-        const sd_bus_error *error = sd_bus_message_get_error(message);
-        if (error == NULL || error->name == NULL ||
-            strcmp(error->name, "org.freedesktop.systemd1.AlreadySubscribed") !=
-                0) {
-            source->count_valid = false;
-            return 0;
-        }
-    }
-    request_systemd_snapshot(source);
-    return 0;
-}
-
-static void request_systemd_subscribe(struct systemd_bus *source) {
-    if (source->bus == NULL || source->subscribe_inflight) {
-        return;
-    }
-    int result = sd_bus_call_method_async(
-        source->bus, NULL, "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
-        "Subscribe", systemd_subscribe_reply, source, NULL);
-    if (result >= 0) {
-        source->subscribe_inflight = true;
-    }
-}
-
-static int systemd_match_installed(sd_bus_message *message, void *userdata,
-                                   sd_bus_error *ret_error) {
-    (void)ret_error;
-    struct systemd_bus *source = userdata;
-    if (!sd_bus_message_is_method_error(message, NULL)) {
-        request_systemd_subscribe(source);
-    }
-    return 0;
-}
-
-static void close_systemd_bus(struct systemd_bus *source) {
-    if (source->registered_fd >= 0) {
-        epoll_ctl(source->app->epoll_fd, EPOLL_CTL_DEL, source->registered_fd,
-                  NULL);
-    }
-    source->registered_fd = -1;
-    source->registered_events = 0;
-    source->match_slot = sd_bus_slot_unref(source->match_slot);
-    source->bus = sd_bus_flush_close_unref(source->bus);
-    source->count_valid = false;
-    source->query_inflight = false;
-    source->subscribe_inflight = false;
-}
-
-static bool open_systemd_bus(struct systemd_bus *source, uint64_t now_ns) {
-    int result = source->scope == SYSTEMD_SCOPE_SYSTEM
-                     ? sd_bus_open_system(&source->bus)
-                     : sd_bus_open_user(&source->bus);
-    if (result < 0) {
-        source->bus = NULL;
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return false;
-    }
-    sd_bus_set_exit_on_disconnect(source->bus, 0);
-    static const char match[] =
-        "type='signal',sender='org.freedesktop.systemd1',"
-        "path='/org/freedesktop/systemd1',"
-        "interface='org.freedesktop.DBus.Properties',"
-        "member='PropertiesChanged',"
-        "arg0='org.freedesktop.systemd1.Manager'";
-    result = sd_bus_add_match_async(source->bus, &source->match_slot, match,
-                                    systemd_property_changed,
-                                    systemd_match_installed, source);
-    if (result < 0) {
-        close_systemd_bus(source);
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return false;
-    }
-    source->retry_deadline_ns = 0;
-    return true;
-}
-
-static bool reconcile_systemd_bus(struct systemd_bus *source, uint64_t now_ns) {
-    if (!systemd_bus_needed(source->app, source->scope)) {
-        if (source->bus != NULL) {
-            close_systemd_bus(source);
-        }
-        return true;
-    }
-    if (source->bus == NULL) {
-        if (source->retry_deadline_ns > now_ns) {
-            return true;
-        }
-        if (!open_systemd_bus(source, now_ns)) {
-            return true;
-        }
-    }
-
-    const int fd = sd_bus_get_fd(source->bus);
-    const int poll_events = sd_bus_get_events(source->bus);
-    if (fd < 0 || poll_events < 0) {
-        close_systemd_bus(source);
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return true;
-    }
-    uint32_t events = EPOLLERR | EPOLLHUP;
-    if ((poll_events & POLLIN) != 0) {
-        events |= EPOLLIN;
-    }
-    if ((poll_events & POLLOUT) != 0) {
-        events |= EPOLLOUT;
-    }
-    if (source->registered_fd == fd && source->registered_events == events) {
-        return true;
-    }
-    if (source->registered_fd >= 0) {
-        epoll_ctl(source->app->epoll_fd, EPOLL_CTL_DEL, source->registered_fd,
-                  NULL);
-        source->registered_fd = -1;
-    }
-    struct epoll_event event = {.events = events, .data.u64 = source->cookie};
-    if (epoll_ctl(source->app->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-        close_systemd_bus(source);
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return false;
-    }
-    source->registered_fd = fd;
-    source->registered_events = events;
-    return true;
-}
-
-static void process_systemd_bus(struct systemd_bus *source, uint64_t now_ns) {
-    if (source->bus == NULL) {
-        return;
-    }
-    for (size_t count = 0; count < 256; count++) {
-        int result = sd_bus_process(source->bus, NULL);
-        if (result > 0) {
-            continue;
-        }
-        if (result < 0) {
-            close_systemd_bus(source);
-            source->retry_deadline_ns = now_ns + 5000000000ULL;
-        }
-        break;
-    }
-    reconcile_systemd_bus(source, now_ns);
-}
-
-static bool power_profiles_needed(const struct app *app) {
-    if (app->current == NULL) {
-        return false;
-    }
-    for (struct power_profiles_subscription *subscription =
-             app->current->power_profiles_subscriptions;
-         subscription != NULL; subscription = subscription->next) {
-        if (!subscription->cancelled) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void notify_power_profiles_subscribers(struct app *app) {
-    struct generation *generation = app->current;
-    struct power_profiles_source *source = &app->power_profiles;
-    if (generation == NULL || generation->staging || !source->active_valid ||
-        !source->profiles_valid) {
-        return;
-    }
-    for (struct power_profiles_subscription *subscription =
-             generation->power_profiles_subscriptions;
-         subscription != NULL; subscription = subscription->next) {
-        struct block *block = subscription->block;
-        if (subscription->cancelled || block->faulted) {
-            continue;
-        }
-        lua_State *lua = generation->lua;
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, subscription->callback_ref);
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
-        lua_newtable(lua);
-        lua_pushstring(lua, source->active);
-        lua_setfield(lua, -2, "active_profile");
-        lua_newtable(lua);
-        for (size_t index = 0; index < source->profile_count; index++) {
-            lua_pushstring(lua, source->profiles[index]);
-            lua_rawseti(lua, -2, (int)index + 1);
-        }
-        lua_setfield(lua, -2, "profiles");
-        if (lua_pcall(lua, 2, 0, 0) != 0) {
-            log_lua_error(block, "power profile event");
-            fault_block(block);
-        }
-    }
-}
-
-static int power_profiles_active_reply(sd_bus_message *message, void *userdata,
-                                       sd_bus_error *ret_error) {
-    (void)ret_error;
-    struct power_profiles_source *source = userdata;
-    source->active_query_inflight = false;
-    const char *active;
-    int result =
-        sd_bus_message_enter_container(message, SD_BUS_TYPE_VARIANT, "s");
-    if (result >= 0) {
-        result = sd_bus_message_read(message, "s", &active);
-    }
-    if (result < 0 || active == NULL ||
-        strlen(active) > I3SD_POWER_PROFILE_NAME_LIMIT) {
-        source->active_valid = false;
-        return 0;
-    }
-    const bool changed =
-        !source->active_valid || strcmp(source->active, active) != 0;
-    strcpy(source->active, active);
-    source->active_valid = true;
-    if (changed) {
-        notify_power_profiles_subscribers(source->app);
-    }
-    return 0;
-}
-
-static int power_profiles_list_reply(sd_bus_message *message, void *userdata,
-                                     sd_bus_error *ret_error) {
-    (void)ret_error;
-    struct power_profiles_source *source = userdata;
-    source->profiles_query_inflight = false;
-    char parsed[I3SD_POWER_PROFILE_LIMIT][I3SD_POWER_PROFILE_NAME_LIMIT + 1] = {
-        {0}};
-    size_t parsed_count = 0;
-    int result =
-        sd_bus_message_enter_container(message, SD_BUS_TYPE_VARIANT, "aa{sv}");
-    if (result > 0) {
-        result =
-            sd_bus_message_enter_container(message, SD_BUS_TYPE_ARRAY, "a{sv}");
-    }
-    while (result > 0 && (result = sd_bus_message_enter_container(
-                              message, SD_BUS_TYPE_ARRAY, "{sv}")) > 0) {
-        char profile[I3SD_POWER_PROFILE_NAME_LIMIT + 1] = {0};
-        while ((result = sd_bus_message_enter_container(
-                    message, SD_BUS_TYPE_DICT_ENTRY, "sv")) > 0) {
-            const char *key;
-            result = sd_bus_message_read(message, "s", &key);
-            if (result < 0) {
-                break;
-            }
-            if (strcmp(key, "Profile") == 0) {
-                const char *value;
-                result = sd_bus_message_enter_container(
-                    message, SD_BUS_TYPE_VARIANT, "s");
-                if (result > 0) {
-                    result = sd_bus_message_read(message, "s", &value);
-                }
-                if (result >= 0 && value != NULL &&
-                    strlen(value) <= I3SD_POWER_PROFILE_NAME_LIMIT) {
-                    strcpy(profile, value);
-                }
-                if (result >= 0) {
-                    result = sd_bus_message_exit_container(message);
-                }
-            } else {
-                result = sd_bus_message_skip(message, "v");
-            }
-            if (result >= 0) {
-                result = sd_bus_message_exit_container(message);
-            }
-            if (result < 0) {
-                break;
-            }
-        }
-        if (result >= 0) {
-            result = sd_bus_message_exit_container(message);
-        }
-        if (profile[0] != '\0' && parsed_count < I3SD_POWER_PROFILE_LIMIT) {
-            strcpy(parsed[parsed_count++], profile);
-        }
-    }
-    if (result < 0 || parsed_count == 0) {
-        source->profiles_valid = false;
-        return 0;
-    }
-    bool changed =
-        !source->profiles_valid || source->profile_count != parsed_count;
-    if (!changed) {
-        changed = memcmp(source->profiles, parsed,
-                         parsed_count * sizeof(parsed[0])) != 0;
-    }
-    memcpy(source->profiles, parsed, parsed_count * sizeof(parsed[0]));
-    source->profile_count = parsed_count;
-    source->profiles_valid = true;
-    if (changed) {
-        notify_power_profiles_subscribers(source->app);
-    }
-    return 0;
-}
-
-static void
-request_power_profiles_snapshots(struct power_profiles_source *source) {
-    if (source->bus == NULL) {
-        return;
-    }
-    if (!source->active_query_inflight) {
-        int result = sd_bus_call_method_async(
-            source->bus, NULL, "org.freedesktop.UPower.PowerProfiles",
-            "/org/freedesktop/UPower/PowerProfiles",
-            "org.freedesktop.DBus.Properties", "Get",
-            power_profiles_active_reply, source, "ss",
-            "org.freedesktop.UPower.PowerProfiles", "ActiveProfile");
-        source->active_query_inflight = result >= 0;
-    }
-    if (!source->profiles_query_inflight) {
-        int result = sd_bus_call_method_async(
-            source->bus, NULL, "org.freedesktop.UPower.PowerProfiles",
-            "/org/freedesktop/UPower/PowerProfiles",
-            "org.freedesktop.DBus.Properties", "Get", power_profiles_list_reply,
-            source, "ss", "org.freedesktop.UPower.PowerProfiles", "Profiles");
-        source->profiles_query_inflight = result >= 0;
-    }
-}
-
-static int power_profiles_changed(sd_bus_message *message, void *userdata,
-                                  sd_bus_error *ret_error) {
-    (void)message;
-    (void)ret_error;
-    request_power_profiles_snapshots(userdata);
-    return 0;
-}
-
-static int power_profiles_match_installed(sd_bus_message *message,
-                                          void *userdata,
-                                          sd_bus_error *ret_error) {
-    (void)ret_error;
-    if (!sd_bus_message_is_method_error(message, NULL)) {
-        request_power_profiles_snapshots(userdata);
-    }
-    return 0;
-}
-
-static void close_power_profiles_source(struct power_profiles_source *source) {
-    if (source->registered_fd >= 0) {
-        epoll_ctl(source->app->epoll_fd, EPOLL_CTL_DEL, source->registered_fd,
-                  NULL);
-    }
-    source->registered_fd = -1;
-    source->registered_events = 0;
-    source->match_slot = sd_bus_slot_unref(source->match_slot);
-    source->bus = sd_bus_flush_close_unref(source->bus);
-    source->active_valid = false;
-    source->profiles_valid = false;
-    source->active_query_inflight = false;
-    source->profiles_query_inflight = false;
-}
-
-static bool open_power_profiles_source(struct power_profiles_source *source,
-                                       uint64_t now_ns) {
-    int result = sd_bus_open_system(&source->bus);
-    if (result < 0) {
-        source->bus = NULL;
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return false;
-    }
-    sd_bus_set_exit_on_disconnect(source->bus, 0);
-    static const char match[] =
-        "type='signal',sender='org.freedesktop.UPower.PowerProfiles',"
-        "path='/org/freedesktop/UPower/PowerProfiles',"
-        "interface='org.freedesktop.DBus.Properties',"
-        "member='PropertiesChanged',"
-        "arg0='org.freedesktop.UPower.PowerProfiles'";
-    result = sd_bus_add_match_async(source->bus, &source->match_slot, match,
-                                    power_profiles_changed,
-                                    power_profiles_match_installed, source);
-    if (result < 0) {
-        close_power_profiles_source(source);
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return false;
-    }
-    source->retry_deadline_ns = 0;
-    return true;
-}
-
-static void
-reconcile_power_profiles_source(struct power_profiles_source *source,
-                                uint64_t now_ns) {
-    if (!power_profiles_needed(source->app)) {
-        if (source->bus != NULL) {
-            close_power_profiles_source(source);
-        }
-        return;
-    }
-    if (source->bus == NULL) {
-        if (source->retry_deadline_ns > now_ns ||
-            !open_power_profiles_source(source, now_ns)) {
-            return;
-        }
-    }
-    const int fd = sd_bus_get_fd(source->bus);
-    const int poll_events = sd_bus_get_events(source->bus);
-    if (fd < 0 || poll_events < 0) {
-        close_power_profiles_source(source);
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return;
-    }
-    uint32_t events = EPOLLERR | EPOLLHUP;
-    events |= (poll_events & POLLIN) != 0 ? EPOLLIN : 0;
-    events |= (poll_events & POLLOUT) != 0 ? EPOLLOUT : 0;
-    if (source->registered_fd == fd && source->registered_events == events) {
-        return;
-    }
-    if (source->registered_fd >= 0) {
-        epoll_ctl(source->app->epoll_fd, EPOLL_CTL_DEL, source->registered_fd,
-                  NULL);
-    }
-    struct epoll_event event = {
-        .events = events,
-        .data.u64 = SOURCE_POWER_PROFILES,
-    };
-    if (epoll_ctl(source->app->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-        close_power_profiles_source(source);
-        source->retry_deadline_ns = now_ns + 5000000000ULL;
-        return;
-    }
-    source->registered_fd = fd;
-    source->registered_events = events;
-}
-
-static void process_power_profiles_source(struct power_profiles_source *source,
-                                          uint64_t now_ns) {
-    if (source->bus == NULL) {
-        return;
-    }
-    for (size_t count = 0; count < 256; count++) {
-        int result = sd_bus_process(source->bus, NULL);
-        if (result > 0) {
-            continue;
-        }
-        if (result < 0) {
-            close_power_profiles_source(source);
-            source->retry_deadline_ns = now_ns + 5000000000ULL;
-        }
-        break;
-    }
-    reconcile_power_profiles_source(source, now_ns);
-}
-
-static int power_profile_set_reply(sd_bus_message *message, void *userdata,
-                                   sd_bus_error *ret_error) {
-    (void)userdata;
-    (void)ret_error;
-    if (sd_bus_message_is_method_error(message, NULL)) {
-        const sd_bus_error *error = sd_bus_message_get_error(message);
-        fprintf(stderr, "i3sd: setting power profile failed: %s\n",
-                error != NULL && error->message != NULL ? error->message
-                                                        : "D-Bus error");
-    }
-    return 0;
-}
-
-static bool set_power_profile(struct app *app, const char *profile) {
-    struct power_profiles_source *source = &app->power_profiles;
-    if (source->bus == NULL) {
-        return false;
-    }
-    return sd_bus_call_method_async(source->bus, NULL,
-                                    "org.freedesktop.UPower.PowerProfiles",
-                                    "/org/freedesktop/UPower/PowerProfiles",
-                                    "org.freedesktop.DBus.Properties", "Set",
-                                    power_profile_set_reply, source, "ssv",
-                                    "org.freedesktop.UPower.PowerProfiles",
-                                    "ActiveProfile", "s", profile) >= 0;
-}
-
-static bool known_power_profile(const struct power_profiles_source *source,
-                                const char *profile) {
-    for (size_t index = 0; index < source->profile_count; index++) {
-        if (strcmp(source->profiles[index], profile) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool write_spawn_input(int fd, const char *input, size_t input_len) {
-    size_t offset = 0;
-    while (offset < input_len) {
-        const ssize_t count = write(fd, input + offset, input_len - offset);
-        if (count > 0) {
-            offset += (size_t)count;
-        } else if (count < 0 && errno == EINTR) {
-            continue;
-        } else {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool open_spawn_process(struct app *app, struct block *block,
-                               char *const argv[], const char *input,
-                               size_t input_len, size_t output_limit,
-                               int callback_ref, uint64_t serial) {
-    if (app->spawn.active) {
-        return false;
-    }
-    /* A private input fd keeps bounded input writes off the child pipe. */
-    const int input_fd = memfd_create("i3sd-spawn-input", MFD_CLOEXEC);
-    if (input_fd < 0 || !write_spawn_input(input_fd, input, input_len) ||
-        lseek(input_fd, 0, SEEK_SET) < 0) {
-        if (input_fd >= 0) {
-            close(input_fd);
-        }
-        return false;
-    }
-    int output_pipe[2];
-    if (pipe2(output_pipe, O_CLOEXEC) < 0) {
-        close(input_fd);
-        return false;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(input_fd);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        return false;
-    }
-    if (pid == 0) {
-        sigset_t empty_mask;
-        sigemptyset(&empty_mask);
-        sigprocmask(SIG_SETMASK, &empty_mask, NULL);
-        if (dup2(input_fd, STDIN_FILENO) < 0 ||
-            dup2(output_pipe[1], STDOUT_FILENO) < 0) {
-            _exit(127);
-        }
-        close(input_fd);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    close(input_fd);
-    close(output_pipe[1]);
-    if (!make_nonblocking(output_pipe[0])) {
-        close(output_pipe[0]);
-        kill(pid, SIGTERM);
-        return false;
-    }
-    struct epoll_event event = {
-        .events = EPOLLIN | EPOLLERR | EPOLLHUP,
-        .data.u64 = SOURCE_SPAWN,
-    };
-    if (epoll_ctl(app->epoll_fd, EPOLL_CTL_ADD, output_pipe[0], &event) < 0) {
-        close(output_pipe[0]);
-        kill(pid, SIGTERM);
-        return false;
-    }
-    struct spawned_process *process = &app->spawn;
-    process->pid = pid;
-    process->output_fd = output_pipe[0];
-    process->block = block;
-    process->callback_ref = callback_ref;
-    process->serial = serial;
-    process->output_limit = output_limit;
-    process->wait_status = 0;
-    process->active = true;
-    process->output_closed = false;
-    process->exited = false;
-    process->overflow = false;
-    process->io_error = false;
-    i3sd_buffer_clear(&process->output);
-    return true;
-}
-
-static void cancel_spawn_process(struct app *app) {
-    struct spawned_process *process = &app->spawn;
-    if (!process->active) {
-        return;
-    }
-    if (process->output_fd >= 0) {
-        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, process->output_fd, NULL);
-        close(process->output_fd);
-        process->output_fd = -1;
-    }
-    if (process->pid > 0) {
-        kill(process->pid, SIGTERM);
-        process->pid = 0;
-    }
-    luaL_unref(process->block->generation->lua, LUA_REGISTRYINDEX,
-               process->callback_ref);
-    process->block = NULL;
-    process->callback_ref = LUA_NOREF;
-    process->active = false;
-    i3sd_buffer_clear(&process->output);
-}
-
-static void finish_spawn_process(struct app *app) {
-    struct spawned_process *process = &app->spawn;
-    if (!process->active || !process->output_closed || !process->exited) {
-        return;
-    }
-
-    struct block *block = process->block;
-    lua_State *lua = block->generation->lua;
-    const int callback_ref = process->callback_ref;
-    lua_rawgeti(lua, LUA_REGISTRYINDEX, callback_ref);
-    lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
-    lua_newtable(lua);
-    lua_pushlstring(lua,
-                    process->output.data == NULL ? "" : process->output.data,
-                    process->output.len);
-    lua_setfield(lua, -2, "stdout");
-    const bool exited_normally = WIFEXITED(process->wait_status);
-    const bool success = exited_normally &&
-                         WEXITSTATUS(process->wait_status) == 0 &&
-                         !process->overflow && !process->io_error;
-    lua_pushboolean(lua, success);
-    lua_setfield(lua, -2, "success");
-    lua_pushboolean(lua, process->overflow);
-    lua_setfield(lua, -2, "overflow");
-    lua_pushboolean(lua, process->io_error);
-    lua_setfield(lua, -2, "io_error");
-    if (exited_normally) {
-        lua_pushinteger(lua, WEXITSTATUS(process->wait_status));
-        lua_setfield(lua, -2, "exit_status");
-    } else if (WIFSIGNALED(process->wait_status)) {
-        lua_pushinteger(lua, WTERMSIG(process->wait_status));
-        lua_setfield(lua, -2, "signal");
-    }
-
-    /* Release the slot before the callback so it may start another child. */
-    process->block = NULL;
-    process->callback_ref = LUA_NOREF;
-    process->active = false;
-    i3sd_buffer_clear(&process->output);
-    if (app->current == block->generation && !block->faulted) {
-        if (lua_pcall(lua, 2, 0, 0) != 0) {
-            log_lua_error(block, "spawn callback");
-            fault_block(block);
-        }
-    } else {
-        lua_pop(lua, 3);
-    }
-    luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
-}
-
-static void close_spawn_output(struct app *app, bool io_error) {
-    struct spawned_process *process = &app->spawn;
-    if (process->output_fd >= 0) {
-        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, process->output_fd, NULL);
-        close(process->output_fd);
-        process->output_fd = -1;
-    }
-    process->output_closed = true;
-    process->io_error = process->io_error || io_error;
-    if (io_error && process->pid > 0) {
-        kill(process->pid, SIGTERM);
-    }
-    finish_spawn_process(app);
-}
-
-static void read_spawn_process(struct app *app) {
-    struct spawned_process *process = &app->spawn;
-    if (!process->active || process->output_fd < 0) {
-        return;
-    }
-    char bytes[4096];
-    size_t consumed = 0;
-    while (consumed < I3SD_SPAWN_READ_BUDGET) {
-        const ssize_t count = read(process->output_fd, bytes, sizeof(bytes));
-        if (count > 0) {
-            consumed += (size_t)count;
-            const size_t available =
-                process->output_limit - process->output.len;
-            const size_t retained =
-                (size_t)count < available ? (size_t)count : available;
-            if (retained > 0 &&
-                !i3sd_buffer_append(&process->output, bytes, retained,
-                                    process->output_limit)) {
-                process->overflow = true;
-            }
-            if ((size_t)count > retained) {
-                process->overflow = true;
-            }
-            continue;
-        }
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;
-        }
-        close_spawn_output(app, count < 0);
-        return;
-    }
-}
-
 static void generation_destroy(struct generation *generation) {
     if (generation == NULL) {
         return;
@@ -2548,7 +1537,7 @@ static void generation_destroy(struct generation *generation) {
     /* Spawn callbacks and child lifetime are owned by their Lua generation. */
     if (generation->app->spawn.active &&
         generation->app->spawn.block->generation == generation) {
-        cancel_spawn_process(generation->app);
+        i3sd_spawn_cancel(generation->app);
     }
     struct logical_timer *timer = generation->timers;
     while (timer != NULL) {
@@ -2670,7 +1659,7 @@ static struct generation *stage_generation(struct app *app) {
     return generation;
 }
 
-static void fault_block(struct block *block) {
+void i3sd_fault_block(struct block *block) {
     if (block->faulted) {
         return;
     }
@@ -2678,7 +1667,7 @@ static void fault_block(struct block *block) {
     struct generation *generation = block->generation;
     if (generation->app->spawn.active &&
         generation->app->spawn.block == block) {
-        cancel_spawn_process(generation->app);
+        i3sd_spawn_cancel(generation->app);
     }
     for (struct logical_timer *timer = generation->timers; timer != NULL;
          timer = timer->next) {
@@ -2751,23 +1740,23 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
         if (!i3sd_timer_add(&app->timer_heap, &timer->timer,
                             activation_ns + timer->delay_ns, interval, timer)) {
             fprintf(stderr, "i3sd: unable to activate configured timer\n");
-            fault_block(timer->block);
+            i3sd_fault_block(timer->block);
         }
     }
     for (size_t index = 0; index < candidate->block_count; index++) {
         struct block *block = candidate->blocks[index];
         if (!call_block_ref(block, block->update_ref, "live refresh", 0)) {
-            fault_block(block);
+            i3sd_fault_block(block);
         } else if (!add_poll_timer(block, activation_ns)) {
             fprintf(stderr, "i3sd: unable to activate polling timer for %s\n",
                     block->name);
-            fault_block(block);
+            i3sd_fault_block(block);
         }
     }
     generation_destroy(old);
     /* Reuse an authoritative shared-bus snapshot across generation reloads. */
-    notify_systemd_subscribers(app);
-    notify_power_profiles_subscribers(app);
+    i3sd_systemd_notify(app);
+    i3sd_power_profiles_notify(app);
     app->render_dirty = true;
     return true;
 }
@@ -2928,8 +1917,8 @@ static void dispatch_click(struct app *app, const char *json, size_t len) {
         lua_setfield(lua, -2, "modifiers");
     }
     if (lua_pcall(lua, 3, 0, 0) != 0) {
-        log_lua_error(target, "click");
-        fault_block(target);
+        i3sd_log_lua_error(target, "click");
+        i3sd_fault_block(target);
     }
     yyjson_doc_free(document);
 }
@@ -3000,7 +1989,7 @@ static void handle_signals(struct app *app) {
                     struct block *block = app->current->blocks[block_index];
                     if (!call_block_ref(block, block->update_ref,
                                         "resume refresh", 0)) {
-                        fault_block(block);
+                        i3sd_fault_block(block);
                     }
                 }
                 break;
@@ -3013,7 +2002,7 @@ static void handle_signals(struct app *app) {
                         app->spawn.pid = 0;
                         app->spawn.wait_status = status;
                         app->spawn.exited = true;
-                        finish_spawn_process(app);
+                        i3sd_spawn_finish(app);
                     }
                 } while (child > 0);
                 break;
@@ -3059,14 +2048,14 @@ static void dispatch_timers(struct app *app, uint64_t now_ns) {
             continue;
         }
         if (!call_block_ref(timer->block, timer->callback_ref, "timer", 0)) {
-            fault_block(timer->block);
+            i3sd_fault_block(timer->block);
             continue;
         }
         if (native->interval_ns != 0 && !timer->cancelled &&
             !timer->block->faulted &&
             !i3sd_timer_reschedule_fixed(&app->timer_heap, native, now_ns)) {
             fprintf(stderr, "i3sd: repeating timer overflow\n");
-            fault_block(timer->block);
+            i3sd_fault_block(timer->block);
         }
     }
 }
@@ -3086,7 +2075,7 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     }
     for (size_t index = 0; index < 2; index++) {
         struct systemd_bus *source = &app->systemd_buses[index];
-        if (!systemd_bus_needed(app, source->scope)) {
+        if (!i3sd_systemd_bus_needed(app, source->scope)) {
             continue;
         }
         if (source->bus == NULL) {
@@ -3107,7 +2096,7 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
         }
     }
     struct power_profiles_source *power = &app->power_profiles;
-    if (power_profiles_needed(app)) {
+    if (i3sd_power_profiles_needed(app)) {
         if (power->bus == NULL) {
             if (power->retry_deadline_ns != 0 &&
                 power->retry_deadline_ns < deadline) {
@@ -3207,9 +2196,9 @@ static void run_event_loop(struct app *app) {
     app->running = true;
     while (app->running) {
         uint64_t now_ns = monotonic_now_ns();
-        reconcile_systemd_bus(&app->systemd_buses[0], now_ns);
-        reconcile_systemd_bus(&app->systemd_buses[1], now_ns);
-        reconcile_power_profiles_source(&app->power_profiles, now_ns);
+        i3sd_systemd_reconcile(&app->systemd_buses[0], now_ns);
+        i3sd_systemd_reconcile(&app->systemd_buses[1], now_ns);
+        i3sd_power_profiles_reconcile(&app->power_profiles, now_ns);
         i3sd_dbus_reconcile(app->dbus, app->current->dbus, now_ns);
         int event_count;
         do {
@@ -3235,17 +2224,19 @@ static void run_event_loop(struct app *app) {
                 handle_inotify(app);
                 break;
             case SOURCE_SYSTEM_BUS:
-                process_systemd_bus(&app->systemd_buses[0], monotonic_now_ns());
+                i3sd_systemd_process(&app->systemd_buses[0],
+                                     monotonic_now_ns());
                 break;
             case SOURCE_USER_BUS:
-                process_systemd_bus(&app->systemd_buses[1], monotonic_now_ns());
+                i3sd_systemd_process(&app->systemd_buses[1],
+                                     monotonic_now_ns());
                 break;
             case SOURCE_POWER_PROFILES:
-                process_power_profiles_source(&app->power_profiles,
-                                              monotonic_now_ns());
+                i3sd_power_profiles_process(&app->power_profiles,
+                                            monotonic_now_ns());
                 break;
             case SOURCE_SPAWN:
-                read_spawn_process(app);
+                i3sd_spawn_read(app);
                 break;
             default:
                 i3sd_dbus_process_cookie(app->dbus, app->current->dbus,
@@ -3256,9 +2247,9 @@ static void run_event_loop(struct app *app) {
         }
 
         now_ns = monotonic_now_ns();
-        process_systemd_bus(&app->systemd_buses[0], now_ns);
-        process_systemd_bus(&app->systemd_buses[1], now_ns);
-        process_power_profiles_source(&app->power_profiles, now_ns);
+        i3sd_systemd_process(&app->systemd_buses[0], now_ns);
+        i3sd_systemd_process(&app->systemd_buses[1], now_ns);
+        i3sd_power_profiles_process(&app->power_profiles, now_ns);
         i3sd_dbus_process(app->dbus, app->current->dbus, now_ns);
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
@@ -3290,17 +2281,17 @@ static void app_destroy(struct app *app) {
     generation_destroy(app->current);
     app->current = NULL;
     if (app->systemd_buses[0].bus != NULL) {
-        close_systemd_bus(&app->systemd_buses[0]);
+        i3sd_systemd_close(&app->systemd_buses[0]);
     }
     if (app->systemd_buses[1].bus != NULL) {
-        close_systemd_bus(&app->systemd_buses[1]);
+        i3sd_systemd_close(&app->systemd_buses[1]);
     }
     if (app->power_profiles.bus != NULL) {
-        close_power_profiles_source(&app->power_profiles);
+        i3sd_power_profiles_close(&app->power_profiles);
     }
     i3sd_dbus_runtime_destroy(app->dbus);
     if (app->spawn.active) {
-        cancel_spawn_process(app);
+        i3sd_spawn_cancel(app);
     }
     i3sd_buffer_destroy(&app->spawn.output);
     i3sd_timer_heap_destroy(&app->timer_heap);
