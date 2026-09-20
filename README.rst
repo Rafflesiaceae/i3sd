@@ -50,3 +50,21 @@ The high-level Lua modules can be loaded explicitly:
    systemd { scope = "both" }
 
 Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for the complete architecture, API contracts and delivery roadmap.
+
+Lua modules can open an asynchronous rofi menu from a block callback. The
+selection is ``nil`` when the menu is cancelled, and ``ctx:rofi`` returns
+``false`` when another menu is already open:
+
+.. code:: lua
+
+   ctx:rofi({
+       prompt = "Action",
+       choices = { "first", "second" },
+   }, function(menu_ctx, selected)
+       if selected ~= nil then
+           -- Apply the selected action without blocking the status loop.
+       end
+   end)
+
+The ``power_profiles`` module uses this primitive for its left-click profile
+selector. Install ``rofi`` when using modules that open menus.

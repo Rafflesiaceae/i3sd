@@ -30,6 +30,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
@@ -48,6 +49,10 @@
 #define I3SD_TIMER_BUDGET 256U
 #define I3SD_OUTPUT_BUDGET (1024U * 1024U)
 #define I3SD_RENDER_INTERVAL_NS 50000000ULL
+#define I3SD_ROFI_CHOICE_LIMIT 256U
+#define I3SD_ROFI_CHOICE_BYTES 1024U
+#define I3SD_ROFI_INPUT_BYTES (64U * 1024U)
+#define I3SD_ROFI_PROMPT_BYTES 256U
 
 enum source_cookie {
     SOURCE_SIGNAL = 1,
@@ -153,7 +158,9 @@ struct power_profiles_source {
 struct rofi_menu {
     pid_t pid;
     int output_fd;
-    char result[I3SD_POWER_PROFILE_NAME_LIMIT + 2];
+    struct block *block;
+    int callback_ref;
+    char result[I3SD_ROFI_CHOICE_BYTES + 2];
     size_t result_len;
 };
 
@@ -250,7 +257,14 @@ static const char power_profiles_handle_metatable[] =
     "i3sd.power_profiles_handle";
 
 static void fault_block(struct block *block);
-static bool open_power_profiles_menu(struct app *app);
+static bool open_rofi_menu(struct app *app, struct block *block,
+                           const char *prompt, const char *choices,
+                           size_t choices_len, int callback_ref);
+static void cancel_rofi_menu(struct app *app,
+                             const struct generation *generation);
+static bool set_power_profile(struct app *app, const char *profile);
+static bool known_power_profile(const struct power_profiles_source *source,
+                                const char *profile);
 static bool make_nonblocking(int fd);
 
 static uint64_t monotonic_now_ns(void) {
@@ -793,13 +807,133 @@ static int lua_context_watch_power_profiles(lua_State *lua) {
     return 1;
 }
 
-static int lua_context_show_power_profiles_menu(lua_State *lua) {
+static int lua_context_rofi(lua_State *lua) {
     struct lua_context *context = check_context(lua, 1);
-    struct app *app = context->block->generation->app;
-    if (app->current != context->block->generation || context->block->faulted) {
-        return 0;
+    struct block *block = context->block;
+    luaL_checktype(lua, 2, LUA_TTABLE);
+    luaL_checktype(lua, 3, LUA_TFUNCTION);
+    static const char *const fields[] = {"prompt", "choices"};
+    check_strict_table(lua, 2, fields, sizeof(fields) / sizeof(fields[0]));
+
+    lua_getfield(lua, 2, "prompt");
+    const char *prompt = "Select";
+    if (!lua_isnil(lua, -1)) {
+        luaL_checktype(lua, -1, LUA_TSTRING);
+        size_t prompt_len;
+        prompt = luaL_checklstring(lua, -1, &prompt_len);
+        if (!valid_text(prompt, prompt_len, I3SD_ROFI_PROMPT_BYTES) ||
+            memchr(prompt, '\n', prompt_len) != NULL ||
+            memchr(prompt, '\r', prompt_len) != NULL) {
+            return luaL_error(lua,
+                              "rofi prompt must be one line of valid "
+                              "UTF-8 up to %u bytes",
+                              I3SD_ROFI_PROMPT_BYTES);
+        }
     }
-    lua_pushboolean(lua, open_power_profiles_menu(app));
+
+    lua_getfield(lua, 2, "choices");
+    luaL_checktype(lua, -1, LUA_TTABLE);
+    const int choices_index = lua_gettop(lua);
+    const size_t choice_count = lua_objlen(lua, choices_index);
+    if (choice_count == 0 || choice_count > I3SD_ROFI_CHOICE_LIMIT) {
+        return luaL_error(lua, "rofi choices must contain 1 to %u entries",
+                          I3SD_ROFI_CHOICE_LIMIT);
+    }
+
+    /* Reject sparse or keyed tables so menu order is fully deterministic. */
+    size_t encountered = 0;
+    lua_pushnil(lua);
+    while (lua_next(lua, choices_index) != 0) {
+        if (lua_type(lua, -2) != LUA_TNUMBER) {
+            return luaL_error(lua,
+                              "rofi choices must be a dense 1-based sequence");
+        }
+        const lua_Number numeric_key = lua_tonumber(lua, -2);
+        if (!isfinite(numeric_key) || numeric_key < 1 ||
+            numeric_key > (lua_Number)choice_count ||
+            floor(numeric_key) != numeric_key) {
+            return luaL_error(lua,
+                              "rofi choices must be a dense 1-based sequence");
+        }
+        encountered++;
+        lua_pop(lua, 1);
+    }
+    if (encountered != choice_count) {
+        return luaL_error(lua, "rofi choices must be a dense 1-based sequence");
+    }
+
+    for (size_t index = 1; index <= choice_count; index++) {
+        lua_rawgeti(lua, choices_index, (int)index);
+        if (lua_type(lua, -1) != LUA_TSTRING) {
+            return luaL_error(lua, "rofi choice %zu must be a string", index);
+        }
+        size_t choice_len;
+        const char *choice = luaL_checklstring(lua, -1, &choice_len);
+        if (choice_len == 0 ||
+            !valid_text(choice, choice_len, I3SD_ROFI_CHOICE_BYTES) ||
+            memchr(choice, '\n', choice_len) != NULL ||
+            memchr(choice, '\r', choice_len) != NULL) {
+            return luaL_error(lua,
+                              "rofi choice %zu must be one non-empty line "
+                              "of valid UTF-8 up to %u bytes",
+                              index, I3SD_ROFI_CHOICE_BYTES);
+        }
+        lua_pop(lua, 1);
+    }
+
+    struct i3sd_buffer input = {0};
+    for (size_t index = 1; index <= choice_count; index++) {
+        lua_rawgeti(lua, choices_index, (int)index);
+        size_t choice_len;
+        const char *choice = lua_tolstring(lua, -1, &choice_len);
+        const bool appended =
+            i3sd_buffer_append(&input, choice, choice_len,
+                               I3SD_ROFI_INPUT_BYTES) &&
+            i3sd_buffer_append_char(&input, '\n', I3SD_ROFI_INPUT_BYTES);
+        lua_pop(lua, 1);
+        if (!appended) {
+            i3sd_buffer_destroy(&input);
+            return luaL_error(lua, "rofi choices exceed the %u-byte limit",
+                              I3SD_ROFI_INPUT_BYTES);
+        }
+    }
+
+    struct app *app = block->generation->app;
+    if (app->current != block->generation || block->faulted) {
+        i3sd_buffer_destroy(&input);
+        lua_pushboolean(lua, false);
+        return 1;
+    }
+
+    lua_pushvalue(lua, 3);
+    const int callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
+    const bool opened =
+        open_rofi_menu(app, block, prompt, input.data, input.len, callback_ref);
+    i3sd_buffer_destroy(&input);
+    if (!opened) {
+        luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
+    }
+    lua_pushboolean(lua, opened);
+    return 1;
+}
+
+static int lua_context_set_power_profile(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct block *block = context->block;
+    size_t profile_len;
+    const char *profile = luaL_checklstring(lua, 2, &profile_len);
+    if (!valid_text(profile, profile_len, I3SD_POWER_PROFILE_NAME_LIMIT)) {
+        return luaL_error(lua,
+                          "power profile must be valid, NUL-free UTF-8 "
+                          "of at most %u bytes",
+                          I3SD_POWER_PROFILE_NAME_LIMIT);
+    }
+    struct app *app = block->generation->app;
+    const bool current = app->current == block->generation && !block->faulted;
+    const bool accepted = current && app->power_profiles.profiles_valid &&
+                          known_power_profile(&app->power_profiles, profile) &&
+                          set_power_profile(app, profile);
+    lua_pushboolean(lua, accepted);
     return 1;
 }
 
@@ -1191,7 +1325,7 @@ static int lua_has_feature(lua_State *lua) {
     bool available =
         strcmp(feature, "collectors") == 0 || strcmp(feature, "inotify") == 0 ||
         strcmp(feature, "psi") == 0 || strcmp(feature, "systemd") == 0 ||
-        strcmp(feature, "power_profiles") == 0;
+        strcmp(feature, "power_profiles") == 0 || strcmp(feature, "rofi") == 0;
     lua_pushboolean(lua, available);
     return 1;
 }
@@ -1208,6 +1342,8 @@ static int lua_features(lua_State *lua) {
     lua_setfield(lua, -2, "systemd");
     lua_pushboolean(lua, true);
     lua_setfield(lua, -2, "power_profiles");
+    lua_pushboolean(lua, true);
+    lua_setfield(lua, -2, "rofi");
     return 1;
 }
 
@@ -1342,9 +1478,10 @@ static void register_lua_api(struct generation *generation) {
         {"after", lua_context_after},
         {"every", lua_context_every},
         {"sample", lua_context_sample},
+        {"rofi", lua_context_rofi},
         {"_watch_systemd_failed", lua_context_watch_systemd_failed},
         {"_watch_power_profiles", lua_context_watch_power_profiles},
-        {"_show_power_profiles_menu", lua_context_show_power_profiles_menu},
+        {"_set_power_profile", lua_context_set_power_profile},
         {NULL, NULL},
     };
     luaL_register(lua, NULL, context_methods);
@@ -2072,17 +2209,18 @@ static int power_profile_set_reply(sd_bus_message *message, void *userdata,
     return 0;
 }
 
-static void set_power_profile(struct app *app, const char *profile) {
+static bool set_power_profile(struct app *app, const char *profile) {
     struct power_profiles_source *source = &app->power_profiles;
     if (source->bus == NULL) {
-        return;
+        return false;
     }
-    sd_bus_call_method_async(
-        source->bus, NULL, "org.freedesktop.UPower.PowerProfiles",
-        "/org/freedesktop/UPower/PowerProfiles",
-        "org.freedesktop.DBus.Properties", "Set", power_profile_set_reply,
-        source, "ssv", "org.freedesktop.UPower.PowerProfiles", "ActiveProfile",
-        "s", profile);
+    return sd_bus_call_method_async(source->bus, NULL,
+                                    "org.freedesktop.UPower.PowerProfiles",
+                                    "/org/freedesktop/UPower/PowerProfiles",
+                                    "org.freedesktop.DBus.Properties", "Set",
+                                    power_profile_set_reply, source, "ssv",
+                                    "org.freedesktop.UPower.PowerProfiles",
+                                    "ActiveProfile", "s", profile) >= 0;
 }
 
 static bool known_power_profile(const struct power_profiles_source *source,
@@ -2095,25 +2233,45 @@ static bool known_power_profile(const struct power_profiles_source *source,
     return false;
 }
 
-static bool open_power_profiles_menu(struct app *app) {
-    struct power_profiles_source *source = &app->power_profiles;
-    if (!source->profiles_valid || source->profile_count == 0 ||
-        app->rofi.output_fd >= 0) {
+static bool write_rofi_input(int fd, const char *input, size_t input_len) {
+    size_t offset = 0;
+    while (offset < input_len) {
+        const ssize_t count = write(fd, input + offset, input_len - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool open_rofi_menu(struct app *app, struct block *block,
+                           const char *prompt, const char *choices,
+                           size_t choices_len, int callback_ref) {
+    if (app->rofi.output_fd >= 0) {
         return false;
     }
-    int input_pipe[2], output_pipe[2];
-    if (pipe2(input_pipe, O_CLOEXEC) < 0) {
+    /* A private input fd avoids blocking the reactor on a pipe writer and
+       prevents a short-lived rofi process from generating SIGPIPE. */
+    const int input_fd = memfd_create("i3sd-rofi-input", MFD_CLOEXEC);
+    if (input_fd < 0 || !write_rofi_input(input_fd, choices, choices_len) ||
+        lseek(input_fd, 0, SEEK_SET) < 0) {
+        if (input_fd >= 0) {
+            close(input_fd);
+        }
         return false;
     }
+    int output_pipe[2];
     if (pipe2(output_pipe, O_CLOEXEC) < 0) {
-        close(input_pipe[0]);
-        close(input_pipe[1]);
+        close(input_fd);
         return false;
     }
     pid_t pid = fork();
     if (pid < 0) {
-        close(input_pipe[0]);
-        close(input_pipe[1]);
+        close(input_fd);
         close(output_pipe[0]);
         close(output_pipe[1]);
         return false;
@@ -2122,21 +2280,18 @@ static bool open_power_profiles_menu(struct app *app) {
         sigset_t empty_mask;
         sigemptyset(&empty_mask);
         sigprocmask(SIG_SETMASK, &empty_mask, NULL);
-        dup2(input_pipe[0], STDIN_FILENO);
-        dup2(output_pipe[1], STDOUT_FILENO);
-        close(input_pipe[0]);
-        close(input_pipe[1]);
+        if (dup2(input_fd, STDIN_FILENO) < 0 ||
+            dup2(output_pipe[1], STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+        close(input_fd);
         close(output_pipe[0]);
         close(output_pipe[1]);
-        execlp("rofi", "rofi", "-dmenu", "-p", "Power profile", NULL);
+        execlp("rofi", "rofi", "-dmenu", "-p", prompt, NULL);
         _exit(127);
     }
-    close(input_pipe[0]);
+    close(input_fd);
     close(output_pipe[1]);
-    for (size_t index = 0; index < source->profile_count; index++) {
-        dprintf(input_pipe[1], "%s\n", source->profiles[index]);
-    }
-    close(input_pipe[1]);
     if (!make_nonblocking(output_pipe[0])) {
         close(output_pipe[0]);
         kill(pid, SIGTERM);
@@ -2153,32 +2308,82 @@ static bool open_power_profiles_menu(struct app *app) {
     }
     app->rofi.pid = pid;
     app->rofi.output_fd = output_pipe[0];
+    app->rofi.block = block;
+    app->rofi.callback_ref = callback_ref;
     app->rofi.result_len = 0;
     return true;
 }
 
-static void finish_power_profiles_menu(struct app *app) {
+static void cancel_rofi_menu(struct app *app,
+                             const struct generation *generation) {
+    struct block *block = app->rofi.block;
+    if (block == NULL || block->generation != generation) {
+        return;
+    }
     if (app->rofi.output_fd >= 0) {
         epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, app->rofi.output_fd, NULL);
         close(app->rofi.output_fd);
         app->rofi.output_fd = -1;
     }
+    if (app->rofi.pid > 0) {
+        kill(app->rofi.pid, SIGTERM);
+        app->rofi.pid = 0;
+    }
+    luaL_unref(generation->lua, LUA_REGISTRYINDEX, app->rofi.callback_ref);
+    app->rofi.block = NULL;
+    app->rofi.callback_ref = LUA_NOREF;
+    app->rofi.result_len = 0;
+}
+
+static void finish_rofi_menu(struct app *app) {
+    if (app->rofi.output_fd >= 0) {
+        epoll_ctl(app->epoll_fd, EPOLL_CTL_DEL, app->rofi.output_fd, NULL);
+        close(app->rofi.output_fd);
+        app->rofi.output_fd = -1;
+    }
+    struct block *block = app->rofi.block;
+    const int callback_ref = app->rofi.callback_ref;
+    app->rofi.block = NULL;
+    app->rofi.callback_ref = LUA_NOREF;
+
     while (app->rofi.result_len > 0 &&
            (app->rofi.result[app->rofi.result_len - 1] == '\n' ||
             app->rofi.result[app->rofi.result_len - 1] == '\r')) {
         app->rofi.result_len--;
     }
-    app->rofi.result[app->rofi.result_len] = '\0';
-    if (known_power_profile(&app->power_profiles, app->rofi.result)) {
-        set_power_profile(app, app->rofi.result);
+    const bool valid_selection =
+        app->rofi.result_len > 0 &&
+        app->rofi.result_len <= I3SD_ROFI_CHOICE_BYTES &&
+        valid_text(app->rofi.result, app->rofi.result_len,
+                   I3SD_ROFI_CHOICE_BYTES) &&
+        memchr(app->rofi.result, '\n', app->rofi.result_len) == NULL &&
+        memchr(app->rofi.result, '\r', app->rofi.result_len) == NULL;
+
+    if (block != NULL) {
+        lua_State *lua = block->generation->lua;
+        if (app->current == block->generation && !block->faulted) {
+            lua_rawgeti(lua, LUA_REGISTRYINDEX, callback_ref);
+            lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
+            if (valid_selection) {
+                lua_pushlstring(lua, app->rofi.result, app->rofi.result_len);
+            } else {
+                lua_pushnil(lua);
+            }
+            if (lua_pcall(lua, 2, 0, 0) != 0) {
+                log_lua_error(block, "rofi callback");
+                fault_block(block);
+            }
+        }
+        luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
     }
+    app->rofi.result_len = 0;
 }
 
-static void read_power_profiles_menu(struct app *app) {
-    while (app->rofi.result_len < I3SD_POWER_PROFILE_NAME_LIMIT + 1) {
+static void read_rofi_menu(struct app *app) {
+    while (app->rofi.result_len < I3SD_ROFI_CHOICE_BYTES + 1) {
         ssize_t count =
             read(app->rofi.output_fd, app->rofi.result + app->rofi.result_len,
-                 I3SD_POWER_PROFILE_NAME_LIMIT + 1 - app->rofi.result_len);
+                 I3SD_ROFI_CHOICE_BYTES + 1 - app->rofi.result_len);
         if (count > 0) {
             app->rofi.result_len += (size_t)count;
             continue;
@@ -2189,16 +2394,18 @@ static void read_power_profiles_menu(struct app *app) {
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return;
         }
-        finish_power_profiles_menu(app);
+        finish_rofi_menu(app);
         return;
     }
-    finish_power_profiles_menu(app);
+    finish_rofi_menu(app);
 }
 
 static void generation_destroy(struct generation *generation) {
     if (generation == NULL) {
         return;
     }
+    /* A popup callback is owned by the generation's Lua registry. */
+    cancel_rofi_menu(generation->app, generation);
     struct logical_timer *timer = generation->timers;
     while (timer != NULL) {
         if (timer->timer.active) {
@@ -2317,6 +2524,9 @@ static void fault_block(struct block *block) {
     }
     block->faulted = true;
     struct generation *generation = block->generation;
+    if (generation->app->rofi.block == block) {
+        cancel_rofi_menu(generation->app, generation);
+    }
     for (struct logical_timer *timer = generation->timers; timer != NULL;
          timer = timer->next) {
         if (timer->block == block && !timer->cancelled) {
@@ -2814,6 +3024,7 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
         .registered_fd = -1,
     };
     app->rofi.output_fd = -1;
+    app->rofi.callback_ref = LUA_NOREF;
     return add_epoll_fd(app, app->signal_fd, EPOLLIN, SOURCE_SIGNAL) &&
            add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
                         SOURCE_STDIN) &&
@@ -2863,7 +3074,7 @@ static void run_event_loop(struct app *app) {
                                               monotonic_now_ns());
                 break;
             case SOURCE_ROFI:
-                read_power_profiles_menu(app);
+                read_rofi_menu(app);
                 break;
             default:
                 break;

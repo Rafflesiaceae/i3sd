@@ -73,6 +73,15 @@ test(
     find_program('tests/check_examples.sh'),
     args: [meson.current_build_dir() / 'i3sd', meson.current_source_dir()],
 )
+test(
+    'rofi-callback',
+    find_program('tests/test_rofi.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/rofi.lua',
+        meson.current_source_dir() / 'tests/fake_rofi.sh',
+    ],
+)
 
 install_data(
     'lua/i3sd/modules/clock.lua',

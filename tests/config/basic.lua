@@ -16,6 +16,12 @@ block {
     order = 2,
     interval = 60,
     init = function(ctx)
+        -- Staging validates rofi requests without starting external programs.
+        assert(not ctx:rofi({
+            prompt = "Test action",
+            choices = { "first", "second" },
+        }, function(_menu_ctx, _selected)
+        end))
         ctx:after(10, function(inner_ctx)
             inner_ctx:set { full_text = "late" }
         end)

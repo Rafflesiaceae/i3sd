@@ -363,6 +363,11 @@ Core primitives:
 
    local snapshot, err = ctx:sample(kind, options)
 
+   local opened = ctx:rofi({
+       prompt = "Action",
+       choices = { "first", "second" },
+   }, fn)
+
    local h = ctx:watch_pressure({
        resource = "memory", -- "cpu", "memory", or "io"
        mode = "some",      -- "some" or "full" where supported
@@ -392,6 +397,7 @@ Core/block callback signatures are:
    fd_fn(ctx, revents)
    file_fn(ctx, event)
    pressure_fn(ctx, event)
+   rofi_fn(ctx, selection)
    defer_fn(ctx)
 
 ``button`` is the i3bar integer button value. The v1 click ``event`` table contains only recognized members that were present on the
@@ -413,6 +419,11 @@ Primitive argument contracts are:
 - ``sample(kind, options)`` requires a documented collector ``kind`` string and either ``nil`` or a strict option table; ``nil`` is
   equivalent to ``{}``. Whole-collector/runtime unavailability returns ``nil, err``. Unsupported optional fields inside an otherwise
   valid snapshot are absent/``nil`` and are never synthesized as numeric zero.
+- ``rofi(options, fn)`` accepts a strict table with an optional single-line ``prompt`` and a required dense ``choices`` sequence.
+  There may be 1 to 256 non-empty, single-line UTF-8 choices of at most 1024 bytes each and at most 64 KiB in aggregate. It returns
+  ``false`` without starting a process while staging or when another menu is open. The asynchronous callback receives the selected
+  text, including a custom value entered by the user, or ``nil`` when rofi is cancelled or returns invalid/oversized text. The menu
+  and callback belong to the calling block and are cancelled before that block's generation is destroyed.
 
 ``revents`` is a table containing only boolean keys ``read``, ``write``, ``error`` and ``hangup`` that are true for the delivered
 condition. ``EPOLLERR``/``EPOLLHUP`` are represented by ``error``/``hangup`` even when not requested explicitly.
