@@ -45,4 +45,4 @@ The high-level Lua modules can be loaded explicitly:
    clock { format = "%H:%M" }
    memory { warn_below = 20, critical_below = 10 }
 
-See ``PLAN.rst`` for the complete architecture, API contracts and delivery roadmap.
+Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for the complete architecture, API contracts and delivery roadmap.

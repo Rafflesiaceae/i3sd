@@ -65,6 +65,11 @@ test(
         meson.current_source_dir() / 'tests/config/basic.lua',
     ],
 )
+test(
+    'example-configs',
+    find_program('tests/check_examples.sh'),
+    args: [meson.current_build_dir() / 'i3sd', meson.current_source_dir()],
+)
 
 install_data(
     'lua/i3sd/modules/clock.lua',
