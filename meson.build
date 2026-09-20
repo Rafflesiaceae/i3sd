@@ -45,6 +45,7 @@ core = static_library(
 
 executable(
     'i3sd',
+    'src/dbus.c',
     'src/main.c',
     include_directories: inc,
     link_with: core,
