@@ -22,6 +22,8 @@ conf.set_quoted(
     'I3SD_LUA_DIR',
     get_option('prefix') / get_option('datadir') / 'i3sd/lua',
 )
+conf.set_quoted('I3SD_BUILD_EXECUTABLE', meson.current_build_dir() / 'i3sd')
+conf.set_quoted('I3SD_SOURCE_LUA_DIR', meson.current_source_dir() / 'lua')
 configure_file(output: 'config.h', configuration: conf)
 
 inc = include_directories('include', '.')

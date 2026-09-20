@@ -1252,6 +1252,41 @@ static bool read_config(const char *path, struct i3sd_buffer *source,
     return true;
 }
 
+static bool running_from_build_tree(void) {
+    char executable[PATH_MAX + 1];
+    const ssize_t length =
+        readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (length < 0 || (size_t)length >= sizeof(executable)) {
+        return false;
+    }
+    executable[length] = '\0';
+    return strcmp(executable, I3SD_BUILD_EXECUTABLE) == 0;
+}
+
+static void configure_lua_path(struct generation *generation) {
+    lua_State *lua = generation->lua;
+    lua_getglobal(lua, "package");
+    lua_getfield(lua, -1, "path");
+    const char *old_path = lua_tostring(lua, -1);
+    if (running_from_build_tree()) {
+        /* Uninstalled builds resolve bundled modules from their source tree. */
+        lua_pushfstring(
+            lua,
+            "%s/?.lua;%s/?/init.lua;%s/?.lua;%s/?/init.lua;%s/?.lua;%s/?/"
+            "init.lua;%s",
+            generation->app->config_dir, generation->app->config_dir,
+            I3SD_SOURCE_LUA_DIR, I3SD_SOURCE_LUA_DIR, I3SD_LUA_DIR,
+            I3SD_LUA_DIR, old_path);
+    } else {
+        lua_pushfstring(lua, "%s/?.lua;%s/?/init.lua;%s/?.lua;%s/?/init.lua;%s",
+                        generation->app->config_dir,
+                        generation->app->config_dir, I3SD_LUA_DIR, I3SD_LUA_DIR,
+                        old_path);
+    }
+    lua_setfield(lua, -3, "path");
+    lua_pop(lua, 2);
+}
+
 static void generation_destroy(struct generation *generation) {
     if (generation == NULL) {
         return;
@@ -1303,15 +1338,7 @@ static struct generation *stage_generation(struct app *app) {
     }
     luaL_openlibs(generation->lua);
     register_lua_api(generation);
-
-    lua_getglobal(generation->lua, "package");
-    lua_getfield(generation->lua, -1, "path");
-    const char *old_path = lua_tostring(generation->lua, -1);
-    lua_pushfstring(
-        generation->lua, "%s/?.lua;%s/?/init.lua;%s/?.lua;%s/?/init.lua;%s",
-        app->config_dir, app->config_dir, I3SD_LUA_DIR, I3SD_LUA_DIR, old_path);
-    lua_setfield(generation->lua, -3, "path");
-    lua_pop(generation->lua, 2);
+    configure_lua_path(generation);
 
     if (luaL_loadbuffer(generation->lua, source.data, source.len,
                         app->config_path) != 0 ||
