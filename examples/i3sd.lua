@@ -1,4 +1,5 @@
 local clock = require("i3sd.modules.clock")
+local battery = require("i3sd.modules.battery")
 local cpu = require("i3sd.modules.cpu")
 local filesystem = require("i3sd.modules.filesystem")
 local memory = require("i3sd.modules.memory")
@@ -7,6 +8,11 @@ local memory = require("i3sd.modules.memory")
 clock {
     format = "%Y-%m-%d %H:%M",
     order = 10,
+}
+
+battery {
+    show = "auto",
+    order = 30,
 }
 
 cpu {

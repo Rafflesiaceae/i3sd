@@ -42,12 +42,14 @@ The high-level Lua modules can be loaded explicitly:
 .. code:: lua
 
    local clock = require("i3sd.modules.clock")
+   local battery = require("i3sd.modules.battery")
    local memory = require("i3sd.modules.memory")
    local pipewire_volume = require("i3sd.modules.pipewire_volume")
    local power_profiles = require("i3sd.modules.power_profiles")
    local systemd = require("i3sd.modules.systemd")
 
    clock { format = "%H:%M" }
+   battery { show = "auto" }
    memory { warn_below = 20, critical_below = 10 }
    pipewire_volume {}
    power_profiles {}

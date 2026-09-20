@@ -5,11 +5,13 @@
 
 #include <lauxlib.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -391,6 +393,146 @@ static int sample_file_stat(lua_State *lua, int options,
     return 1;
 }
 
+static int compare_supply_names(const void *left, const void *right) {
+    return strcmp(left, right);
+}
+
+static bool read_supply_text(const char *name, const char *field, char *value,
+                             size_t value_size) {
+    char path[PATH_MAX];
+    const int path_length = snprintf(path, sizeof(path),
+                                     "/sys/class/power_supply/%s/%s", name,
+                                     field);
+    if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+        return false;
+    }
+    FILE *file = fopen(path, "re");
+    if (file == NULL) {
+        return false;
+    }
+    const bool read = fgets(value, (int)value_size, file) != NULL;
+    fclose(file);
+    if (!read) {
+        return false;
+    }
+    value[strcspn(value, "\r\n")] = '\0';
+    return valid_text(value, strlen(value), value_size - 1);
+}
+
+static bool read_supply_counter(const char *name, const char *field,
+                                int64_t *value) {
+    char text[64];
+    if (!read_supply_text(name, field, text, sizeof(text))) {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    const long long parsed = strtoll(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        return false;
+    }
+    *value = (int64_t)parsed;
+    return true;
+}
+
+static void set_optional_supply_counter(
+    lua_State *lua, const char *name, const char *attribute,
+    const char *field, const struct i3sd_collector_host *host) {
+    int64_t value;
+    if (read_supply_counter(name, attribute, &value)) {
+        host->push_int64(lua, value);
+        lua_setfield(lua, -2, field);
+    }
+}
+
+static int sample_power_supply(lua_State *lua, int options,
+                               const struct i3sd_collector_host *host) {
+    check_strict_table(lua, options, NULL, 0);
+    DIR *directory = opendir("/sys/class/power_supply");
+    if (directory == NULL) {
+        const int saved_errno = errno;
+        lua_pushnil(lua);
+        push_error(lua, saved_errno == ENOENT ? "unsupported" : "unavailable",
+                   strerror(saved_errno), "power_supply", saved_errno);
+        return 2;
+    }
+
+    /* Power-supply inventories are small; keep the snapshot bounded. */
+    char names[256][NAME_MAX + 1];
+    size_t name_count = 0;
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (!valid_text(entry->d_name, strlen(entry->d_name), NAME_MAX)) {
+            continue;
+        }
+        if (name_count == sizeof(names) / sizeof(names[0])) {
+            closedir(directory);
+            lua_pushnil(lua);
+            push_error(lua, "too_large", "too many power supplies",
+                       "power_supply", 0);
+            return 2;
+        }
+        memcpy(names[name_count++], entry->d_name, strlen(entry->d_name) + 1);
+    }
+    const int read_errno = errno;
+    closedir(directory);
+    if (read_errno != 0) {
+        lua_pushnil(lua);
+        push_error(lua, "unavailable", strerror(read_errno), "power_supply",
+                   read_errno);
+        return 2;
+    }
+    qsort(names, name_count, sizeof(names[0]), compare_supply_names);
+
+    push_snapshot_header(lua, host, "/sys/class/power_supply");
+    const int snapshot = lua_gettop(lua);
+    lua_newtable(lua);
+    size_t supply_index = 1;
+    for (size_t index = 0; index < name_count; index++) {
+        char type[64];
+        if (!read_supply_text(names[index], "type", type, sizeof(type))) {
+            continue;
+        }
+        lua_newtable(lua);
+        lua_pushstring(lua, names[index]);
+        lua_setfield(lua, -2, "name");
+        lua_pushstring(lua, type);
+        lua_setfield(lua, -2, "type");
+
+        char status[64];
+        if (read_supply_text(names[index], "status", status, sizeof(status))) {
+            lua_pushstring(lua, status);
+            lua_setfield(lua, -2, "status");
+        }
+        set_optional_supply_counter(lua, names[index], "energy_now",
+                                   "energy_now_uwh", host);
+        set_optional_supply_counter(lua, names[index], "energy_full",
+                                   "energy_full_uwh", host);
+        set_optional_supply_counter(lua, names[index], "energy_full_design",
+                                   "energy_full_design_uwh", host);
+        set_optional_supply_counter(lua, names[index], "charge_now",
+                                   "charge_now_uah", host);
+        set_optional_supply_counter(lua, names[index], "charge_full",
+                                   "charge_full_uah", host);
+        set_optional_supply_counter(lua, names[index], "charge_full_design",
+                                   "charge_full_design_uah", host);
+        set_optional_supply_counter(lua, names[index], "power_now",
+                                   "power_now_uw", host);
+        set_optional_supply_counter(lua, names[index], "current_now",
+                                   "current_now_ua", host);
+        set_optional_supply_counter(lua, names[index], "voltage_now",
+                                   "voltage_now_uv", host);
+        lua_rawseti(lua, -2, (int)supply_index++);
+    }
+    lua_setfield(lua, snapshot, "supplies");
+    return 1;
+}
+
 int i3sd_collect(lua_State *lua, const char *kind, int options,
                  const struct i3sd_collector_host *host) {
     if (strcmp(kind, "cpu") == 0) {
@@ -413,6 +555,9 @@ int i3sd_collect(lua_State *lua, const char *kind, int options,
     }
     if (strcmp(kind, "file_stat") == 0) {
         return sample_file_stat(lua, options, host);
+    }
+    if (strcmp(kind, "power_supply") == 0) {
+        return sample_power_supply(lua, options, host);
     }
     return luaL_error(lua, "unknown collector '%s'", kind);
 }
