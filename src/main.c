@@ -881,11 +881,14 @@ static int lua_context_spawn(lua_State *lua) {
         }
         size_t argument_len;
         const char *argument = lua_tolstring(lua, -1, &argument_len);
-        if (argument_len == 0 || argument_len > I3SD_SPAWN_ARG_BYTES ||
+        if (index == 1 && argument_len == 0) {
+            return luaL_error(lua, "spawn executable must be non-empty");
+        }
+        if (argument_len > I3SD_SPAWN_ARG_BYTES ||
             memchr(argument, '\0', argument_len) != NULL) {
             return luaL_error(lua,
-                              "spawn argv entry %zu must be non-empty, "
-                              "NUL-free, and at most %u bytes",
+                              "spawn argv entry %zu must be NUL-free and at "
+                              "most %u bytes",
                               index, I3SD_SPAWN_ARG_BYTES);
         }
         if (argument_len + 1 > I3SD_SPAWN_ARGV_BYTES - argv_bytes) {

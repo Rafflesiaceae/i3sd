@@ -421,13 +421,14 @@ Primitive argument contracts are:
   equivalent to ``{}``. Whole-collector/runtime unavailability returns ``nil, err``. Unsupported optional fields inside an otherwise
   valid snapshot are absent/``nil`` and are never synthesized as numeric zero.
 - ``spawn(options, fn)`` accepts a strict table with a required dense ``argv`` sequence, optional binary ``stdin`` string and optional
-  ``stdout_limit``. ``argv`` contains 1 to 64 non-empty NUL-free strings, each at most 4096 bytes and at most 64 KiB in aggregate;
-  ``stdin`` and ``stdout_limit`` are each bounded to 64 KiB. Execution uses ``execvp`` directly and never invokes a shell. At most one
-  child is active process-wide. The method returns ``nil`` without starting a child during staging, while another child is active or
-  when process setup fails; otherwise it returns an idempotently cancellable block-owned handle. On normal completion the callback
-  receives a result table containing binary ``stdout``, booleans ``success``, ``overflow`` and ``io_error``, and either integer
-  ``exit_status`` or ``signal``. ``success`` requires exit status zero and complete, error-free captured output. Cancellation does not
-  invoke the callback. A child and callback are cancelled before their block's generation is destroyed.
+  ``stdout_limit``. ``argv`` contains 1 to 64 NUL-free strings, each at most 4096 bytes and at most 64 KiB in aggregate. Its first
+  string, the executable passed to ``execvp``, must be non-empty; subsequent arguments may be empty. ``stdin`` and ``stdout_limit``
+  are each bounded to 64 KiB. Execution uses ``execvp`` directly and never invokes a shell. At most one child is active process-wide.
+  The method returns ``nil`` without starting a child during staging, while another child is active or when process setup fails;
+  otherwise it returns an idempotently cancellable block-owned handle. On normal completion the callback receives a result table
+  containing binary ``stdout``, booleans ``success``, ``overflow`` and ``io_error``, and either integer ``exit_status`` or ``signal``.
+  ``success`` requires exit status zero and complete, error-free captured output. Cancellation does not invoke the callback. A child
+  and callback are cancelled before their block's generation is destroyed.
 
 ``revents`` is a table containing only boolean keys ``read``, ``write``, ``error`` and ``hangup`` that are true for the delivered
 condition. ``EPOLLERR``/``EPOLLHUP`` are represented by ``error``/``hangup`` even when not requested explicitly.

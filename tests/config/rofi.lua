@@ -18,7 +18,7 @@ block {
         end))
         cancelled:cancel()
         menu = assert(ctx:spawn({
-            argv = { "rofi", "-dmenu", "-p", "Test menu" },
+            argv = { "rofi", "-dmenu", "-p", "Test menu", "" },
             stdin = "first\nsecond\n",
             stdout_limit = 1024,
         }, function(menu_ctx, result)
