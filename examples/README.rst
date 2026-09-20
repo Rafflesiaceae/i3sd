@@ -5,6 +5,8 @@ Examples
 
 ``minimal.lua`` demonstrates the low-level block API without loading modules. ``interactive.lua`` demonstrates per-consumer CPU deltas, click handling, and resettable one-shot timers without spawning external commands.
 
+``i3status-equivalent.lua`` ports the currently supported parts of ``~/.config/i3status/config``: the VPN pathname indicator, root-filesystem and memory warnings, load display, colors, ordering, and local clock. Its final comment records the original blocks that do not yet have a corresponding i3sd API.
+
 Validate a configuration before using it:
 
 .. code:: console
