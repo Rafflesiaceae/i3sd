@@ -13,7 +13,23 @@ project(
 cc = meson.get_compiler('c')
 m = cc.find_library('m', required: true)
 luajit = dependency('luajit')
-yyjson = dependency('yyjson')
+
+# yyjson ships as a vendored subtree (see vendor.py) instead of a system
+# package, so it is built from source here rather than via dependency().
+yyjson_inc = include_directories('vendor/yyjson/src')
+yyjson_lib = static_library(
+    'yyjson',
+    'vendor/yyjson/src/yyjson.c',
+    include_directories: yyjson_inc,
+    # The vendored sources are third-party and not held to this project's
+    # own warning/werror settings.
+    override_options: ['warning_level=0', 'werror=false'],
+)
+yyjson = declare_dependency(
+    link_with: yyjson_lib,
+    include_directories: yyjson_inc,
+)
+
 xxhash = dependency('libxxhash')
 systemd = dependency('libsystemd')
 pipewire = dependency('libpipewire-0.3', required: false)
