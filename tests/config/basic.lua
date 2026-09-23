@@ -1,3 +1,21 @@
+assert(i3sd.has_feature("json"))
+assert(i3sd.features().json)
+
+local decoded, decode_error = i3sd.json_decode(
+    '{"name":"codex","count":0,"ok":true,"nothing":null,"items":[1,"two"]}'
+)
+assert(decoded ~= nil, decode_error)
+assert(decoded.name == "codex")
+assert(tonumber(decoded.count) == 0)
+assert(decoded.ok == true)
+assert(decoded.nothing == i3sd.json_null)
+assert(tonumber(decoded.items[1]) == 1)
+assert(decoded.items[2] == "two")
+
+local invalid, invalid_error = i3sd.json_decode("{")
+assert(invalid == nil)
+assert(type(invalid_error) == "string")
+
 block {
     name = "first",
     order = 1,

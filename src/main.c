@@ -56,6 +56,8 @@
 #define I3SD_SPAWN_ARGV_BYTES (64U * 1024U)
 #define I3SD_SPAWN_INPUT_BYTES (64U * 1024U)
 #define I3SD_SPAWN_OUTPUT_BYTES (64U * 1024U)
+#define I3SD_JSON_MAX_BYTES (1024U * 1024U)
+#define I3SD_JSON_MAX_DEPTH 64U
 
 struct lua_context {
     struct block *block;
@@ -875,6 +877,100 @@ static void push_int64(lua_State *lua, int64_t value) {
     }
 }
 
+static char json_null_sentinel;
+
+static bool push_json_value(lua_State *lua, yyjson_val *value, unsigned depth) {
+    const int initial_top = lua_gettop(lua);
+    if (depth > I3SD_JSON_MAX_DEPTH) {
+        return false;
+    }
+    if (yyjson_is_null(value)) {
+        lua_pushlightuserdata(lua, &json_null_sentinel);
+        return true;
+    }
+    if (yyjson_is_bool(value)) {
+        lua_pushboolean(lua, yyjson_get_bool(value));
+        return true;
+    }
+    if (yyjson_is_uint(value)) {
+        push_uint64(lua, yyjson_get_uint(value));
+        return true;
+    }
+    if (yyjson_is_sint(value)) {
+        push_int64(lua, yyjson_get_sint(value));
+        return true;
+    }
+    if (yyjson_is_real(value)) {
+        lua_pushnumber(lua, yyjson_get_real(value));
+        return true;
+    }
+    if (yyjson_is_str(value)) {
+        lua_pushlstring(lua, yyjson_get_str(value), yyjson_get_len(value));
+        return true;
+    }
+    if (yyjson_is_arr(value)) {
+        lua_createtable(lua, (int)yyjson_arr_size(value), 0);
+        size_t index, maximum;
+        yyjson_val *item;
+        yyjson_arr_foreach(value, index, maximum, item) {
+            if (!push_json_value(lua, item, depth + 1)) {
+                lua_settop(lua, initial_top);
+                return false;
+            }
+            lua_rawseti(lua, -2, (int)index + 1);
+        }
+        return true;
+    }
+    if (yyjson_is_obj(value)) {
+        lua_createtable(lua, 0, (int)yyjson_obj_size(value));
+        size_t index, maximum;
+        yyjson_val *key, *item;
+        yyjson_obj_foreach(value, index, maximum, key, item) {
+            lua_pushlstring(lua, yyjson_get_str(key), yyjson_get_len(key));
+            if (!push_json_value(lua, item, depth + 1)) {
+                lua_settop(lua, initial_top);
+                return false;
+            }
+            lua_rawset(lua, -3);
+        }
+        return true;
+    }
+    lua_settop(lua, initial_top);
+    return false;
+}
+
+static int lua_json_decode(lua_State *lua) {
+    size_t length;
+    const char *text = luaL_checklstring(lua, 1, &length);
+    if (length > I3SD_JSON_MAX_BYTES) {
+        lua_pushnil(lua);
+        lua_pushliteral(lua, "JSON input exceeds the 1 MiB limit");
+        return 2;
+    }
+
+    yyjson_read_err error = {0};
+    yyjson_doc *document =
+        yyjson_read_opts((char *)(void *)text, length, 0, NULL, &error);
+    if (document == NULL) {
+        char message[256];
+        snprintf(message, sizeof(message), "invalid JSON at byte %zu: %s",
+                 error.pos, error.msg == NULL ? "parse error" : error.msg);
+        lua_pushnil(lua);
+        lua_pushstring(lua, message);
+        return 2;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(document);
+    if (!push_json_value(lua, root, 0)) {
+        yyjson_doc_free(document);
+        lua_pushnil(lua);
+        lua_pushliteral(lua, "JSON nesting exceeds the supported depth");
+        return 2;
+    }
+    yyjson_doc_free(document);
+    return 1;
+}
+
 static const struct i3sd_collector_host collector_host = {
     .now_ns = monotonic_now_ns,
     .push_uint64 = push_uint64,
@@ -903,6 +999,7 @@ static int lua_has_feature(lua_State *lua) {
         strcmp(feature, "psi") == 0 || strcmp(feature, "systemd") == 0 ||
         strcmp(feature, "power_profiles") == 0 ||
         strcmp(feature, "spawn") == 0 || strcmp(feature, "dbus") == 0 ||
+        strcmp(feature, "json") == 0 ||
         (I3SD_HAVE_NVML && strcmp(feature, "nvidia") == 0) ||
         (I3SD_HAVE_PIPEWIRE && strcmp(feature, "pipewire") == 0);
     lua_pushboolean(lua, available);
@@ -925,6 +1022,8 @@ static int lua_features(lua_State *lua) {
     lua_setfield(lua, -2, "spawn");
     lua_pushboolean(lua, true);
     lua_setfield(lua, -2, "dbus");
+    lua_pushboolean(lua, true);
+    lua_setfield(lua, -2, "json");
     lua_pushboolean(lua, I3SD_HAVE_NVML);
     lua_setfield(lua, -2, "nvidia");
     lua_pushboolean(lua, I3SD_HAVE_PIPEWIRE);
@@ -1152,6 +1251,10 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, -2, "has_feature");
     lua_pushcfunction(lua, lua_features);
     lua_setfield(lua, -2, "features");
+    lua_pushcfunction(lua, lua_json_decode);
+    lua_setfield(lua, -2, "json_decode");
+    lua_pushlightuserdata(lua, &json_null_sentinel);
+    lua_setfield(lua, -2, "json_null");
     i3sd_dbus_register_lua(generation->dbus, -1);
     lua_setglobal(lua, "i3sd");
 
