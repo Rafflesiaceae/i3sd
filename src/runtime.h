@@ -19,6 +19,7 @@
 
 #define I3SD_MAX_BLOCKS 256U
 #define I3SD_MAX_TIMERS 4096U
+#define I3SD_CONFIG_ERROR_MAX 6144U
 #define I3SD_POWER_PROFILE_LIMIT 16U
 #define I3SD_POWER_PROFILE_NAME_LIMIT 63U
 
@@ -219,7 +220,9 @@ struct app {
     uint64_t next_registration_cookie;
     size_t prelude_offset;
     uint64_t last_render_ns;
+    char config_error[I3SD_CONFIG_ERROR_MAX + 1];
     bool stdout_registered;
+    bool config_error_active;
     bool render_dirty;
     bool reload_dirty;
     bool running;

@@ -30,6 +30,7 @@
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -118,8 +119,37 @@ static char *copy_bytes(const char *value, size_t len) {
     return copy;
 }
 
+static void set_config_error(struct app *app, const char *format, ...) {
+    char detail[I3SD_CONFIG_ERROR_MAX + 1];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(detail, sizeof(detail), format, arguments);
+    va_end(arguments);
+
+    /* i3bar receives only the first diagnostic line as one bounded block. */
+    detail[strcspn(detail, "\r\n")] = '\0';
+    if (detail[0] == '\0' || !i3sd_valid_utf8(detail, strlen(detail))) {
+        strcpy(detail, "configuration failed");
+    }
+    snprintf(app->config_error, sizeof(app->config_error), "ERROR: %.*s",
+             (int)(sizeof(app->config_error) - sizeof("ERROR: ")), detail);
+    app->config_error_active = true;
+    app->render_dirty = true;
+}
+
+static void clear_config_error(struct app *app) {
+    app->config_error[0] = '\0';
+    app->config_error_active = false;
+    app->render_dirty = true;
+}
+
 void i3sd_log_lua_error(struct block *block, const char *phase) {
     const char *message = lua_tostring(block->generation->lua, -1);
+    if (block->generation->staging) {
+        set_config_error(block->generation->app, "block %s %s failed: %s",
+                         block->name, phase,
+                         message == NULL ? "unknown Lua error" : message);
+    }
     fprintf(stderr, "i3sd: block %s %s failed: %s\n", block->name, phase,
             message == NULL ? "unknown Lua error" : message);
     lua_pop(block->generation->lua, 1);
@@ -1284,16 +1314,19 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, LUA_REGISTRYINDEX, "i3sd.current_generation");
 }
 
-static bool read_config(const char *path, struct i3sd_buffer *source,
+static bool read_config(struct app *app, struct i3sd_buffer *source,
                         XXH128_hash_t *digest, struct stat *metadata) {
+    const char *path = app->config_path;
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) {
+        set_config_error(app, "cannot open %s: %s", path, strerror(errno));
         fprintf(stderr, "i3sd: cannot open %s: %s\n", path, strerror(errno));
         return false;
     }
     struct stat before, after;
     if (fstat(fd, &before) < 0 || !S_ISREG(before.st_mode) ||
         before.st_size < 0 || before.st_size > I3SD_MAX_CONFIG) {
+        set_config_error(app, "config must be a regular file of at most 1 MiB");
         fprintf(stderr,
                 "i3sd: config must be a regular file of at most 1 MiB\n");
         close(fd);
@@ -1306,12 +1339,15 @@ static bool read_config(const char *path, struct i3sd_buffer *source,
         if (count > 0) {
             if (!i3sd_buffer_append(source, bytes, (size_t)count,
                                     I3SD_MAX_CONFIG)) {
+                set_config_error(app,
+                                 "unable to buffer the configuration file");
                 close(fd);
                 return false;
             }
         } else if (count == 0) {
             break;
         } else if (errno != EINTR) {
+            set_config_error(app, "cannot read %s: %s", path, strerror(errno));
             fprintf(stderr, "i3sd: cannot read %s: %s\n", path,
                     strerror(errno));
             close(fd);
@@ -1319,6 +1355,7 @@ static bool read_config(const char *path, struct i3sd_buffer *source,
         }
     }
     if (fstat(fd, &after) < 0) {
+        set_config_error(app, "cannot inspect %s: %s", path, strerror(errno));
         close(fd);
         return false;
     }
@@ -1327,6 +1364,7 @@ static bool read_config(const char *path, struct i3sd_buffer *source,
         before.st_size != after.st_size ||
         before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
         before.st_mtim.tv_nsec != after.st_mtim.tv_nsec) {
+        set_config_error(app, "configuration changed while it was being read");
         fprintf(stderr, "i3sd: config changed while it was being read\n");
         return false;
     }
@@ -1442,17 +1480,9 @@ static void generation_destroy(struct generation *generation) {
     free(generation);
 }
 
-static struct generation *stage_generation(struct app *app) {
-    struct i3sd_buffer source = {0};
-    XXH128_hash_t digest, validation_digest;
-    struct stat metadata, validation_metadata;
-    if (!read_config(app->config_path, &source, &digest, &metadata)) {
-        i3sd_buffer_destroy(&source);
-        return NULL;
-    }
+static struct generation *create_generation(struct app *app) {
     struct generation *generation = calloc(1, sizeof(*generation));
     if (generation == NULL) {
-        i3sd_buffer_destroy(&source);
         return NULL;
     }
     generation->app = app;
@@ -1460,24 +1490,43 @@ static struct generation *stage_generation(struct app *app) {
     generation->lua = luaL_newstate();
     if (generation->lua == NULL) {
         generation_destroy(generation);
-        i3sd_buffer_destroy(&source);
         return NULL;
     }
     luaL_openlibs(generation->lua);
     generation->dbus = i3sd_dbus_generation_create(generation->lua, &dbus_host);
     if (generation->dbus == NULL) {
         generation_destroy(generation);
-        i3sd_buffer_destroy(&source);
         return NULL;
     }
     register_lua_api(generation);
     configure_lua_path(generation);
+    return generation;
+}
+
+static struct generation *stage_generation(struct app *app, bool *fatal) {
+    *fatal = false;
+    struct i3sd_buffer source = {0};
+    XXH128_hash_t digest, validation_digest;
+    struct stat metadata, validation_metadata;
+    if (!read_config(app, &source, &digest, &metadata)) {
+        i3sd_buffer_destroy(&source);
+        return NULL;
+    }
+    struct generation *generation = create_generation(app);
+    if (generation == NULL) {
+        *fatal = true;
+        i3sd_buffer_destroy(&source);
+        return NULL;
+    }
 
     if (luaL_loadbuffer(generation->lua, source.data, source.len,
                         app->config_path) != 0 ||
         lua_pcall(generation->lua, 0, 0, 0) != 0) {
+        const char *message = lua_tostring(generation->lua, -1);
+        set_config_error(app, "%s",
+                         message == NULL ? "unknown Lua error" : message);
         fprintf(stderr, "i3sd: configuration failed: %s\n",
-                lua_tostring(generation->lua, -1));
+                message == NULL ? "unknown Lua error" : message);
         generation_destroy(generation);
         i3sd_buffer_destroy(&source);
         return NULL;
@@ -1496,7 +1545,7 @@ static struct generation *stage_generation(struct app *app) {
           sizeof(generation->ordered[0]), compare_blocks);
 
     struct i3sd_buffer validation = {0};
-    bool stable = read_config(app->config_path, &validation, &validation_digest,
+    bool stable = read_config(app, &validation, &validation_digest,
                               &validation_metadata) &&
                   XXH128_isEqual(digest, validation_digest) &&
                   metadata.st_dev == validation_metadata.st_dev &&
@@ -1504,6 +1553,7 @@ static struct generation *stage_generation(struct app *app) {
     i3sd_buffer_destroy(&validation);
     i3sd_buffer_destroy(&source);
     if (!stable) {
+        set_config_error(app, "configuration became obsolete during staging");
         fprintf(stderr, "i3sd: configuration became obsolete during staging\n");
         generation_destroy(generation);
         app->reload_dirty = true;
@@ -1623,26 +1673,59 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
     return true;
 }
 
+static bool append_config_error(struct app *app) {
+    yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
+    if (document == NULL) {
+        return false;
+    }
+    yyjson_mut_val *object = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, object);
+    const bool built =
+        yyjson_mut_obj_add_strcpy(document, object, "full_text",
+                                  app->config_error) &&
+        yyjson_mut_obj_add_bool(document, object, "urgent", true) &&
+        yyjson_mut_obj_add_strcpy(document, object, "name", "i3sd-error") &&
+        yyjson_mut_obj_add_bool(document, object, "separator", false) &&
+        yyjson_mut_obj_add_int(document, object, "separator_block_width", 9);
+    size_t json_length = 0;
+    char *json = built ? yyjson_mut_write(document, 0, &json_length) : NULL;
+    yyjson_mut_doc_free(document);
+    if (json == NULL) {
+        return false;
+    }
+    const bool appended = i3sd_buffer_append(&app->frame, json, json_length,
+                                             I3SD_FRAME_MAX_BYTES);
+    free(json);
+    return appended;
+}
+
 static bool render_status(struct app *app) {
     i3sd_buffer_clear(&app->frame);
     if (!i3sd_buffer_append_char(&app->frame, '[', I3SD_FRAME_MAX_BYTES)) {
         return false;
     }
-    bool first = true;
-    for (size_t index = 0; index < app->current->block_count; index++) {
-        struct block *block = app->current->ordered[index];
-        if (block->faulted || !block->state.visible) {
-            continue;
-        }
-        if (!first &&
-            !i3sd_buffer_append_char(&app->frame, ',', I3SD_FRAME_MAX_BYTES)) {
+    if (app->config_error_active) {
+        if (!append_config_error(app)) {
             return false;
         }
-        if (!i3sd_buffer_append(&app->frame, block->fragment.data,
-                                block->fragment.len, I3SD_FRAME_MAX_BYTES)) {
-            return false;
+    } else {
+        bool first = true;
+        for (size_t index = 0; index < app->current->block_count; index++) {
+            struct block *block = app->current->ordered[index];
+            if (block->faulted || !block->state.visible) {
+                continue;
+            }
+            if (!first && !i3sd_buffer_append_char(&app->frame, ',',
+                                                   I3SD_FRAME_MAX_BYTES)) {
+                return false;
+            }
+            if (!i3sd_buffer_append(&app->frame, block->fragment.data,
+                                    block->fragment.len,
+                                    I3SD_FRAME_MAX_BYTES)) {
+                return false;
+            }
+            first = false;
         }
-        first = false;
     }
     if (!i3sd_buffer_append_char(&app->frame, ']', I3SD_FRAME_MAX_BYTES)) {
         return false;
@@ -2139,9 +2222,15 @@ static void run_event_loop(struct app *app) {
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
             app->reload_dirty = false;
-            struct generation *candidate = stage_generation(app);
+            bool fatal = false;
+            struct generation *candidate = stage_generation(app, &fatal);
             if (candidate != NULL) {
+                clear_config_error(app);
                 commit_generation(app, candidate);
+            } else if (fatal) {
+                fprintf(stderr,
+                        "i3sd: unable to allocate configuration state\n");
+                app->running = false;
             }
         }
         if (app->render_dirty && !i3sd_output_has_pending(&app->output) &&
@@ -2334,15 +2423,32 @@ int main(int argc, char **argv) {
         app_destroy(&app);
         return EXIT_FAILURE;
     }
-    struct generation *initial = stage_generation(&app);
-    if (initial == NULL) {
-        app_destroy(&app);
-        return EXIT_FAILURE;
-    }
+    bool fatal_config_error = false;
+    struct generation *initial = stage_generation(&app, &fatal_config_error);
     if (check_only) {
+        if (initial == NULL) {
+            app_destroy(&app);
+            return EXIT_FAILURE;
+        }
         generation_destroy(initial);
         app_destroy(&app);
         return EXIT_SUCCESS;
+    }
+    if (initial == NULL && fatal_config_error) {
+        fprintf(stderr, "i3sd: unable to allocate configuration state\n");
+        app_destroy(&app);
+        return EXIT_FAILURE;
+    }
+    if (initial == NULL) {
+        /* Keep a valid empty generation alive while watching for a fix. */
+        initial = create_generation(&app);
+        if (initial == NULL) {
+            fprintf(stderr, "i3sd: unable to allocate fallback state\n");
+            app_destroy(&app);
+            return EXIT_FAILURE;
+        }
+    } else {
+        clear_config_error(&app);
     }
     if (!initialize_runtime(&app, &signal_mask)) {
         fprintf(stderr, "i3sd: runtime initialization failed: %s\n",

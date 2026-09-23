@@ -134,6 +134,15 @@ test(
         meson.current_source_dir() / 'tests/fake_rofi.sh',
     ],
 )
+test(
+    'config-recovery',
+    find_program('tests/test_config_recovery.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/reload-recovery.lua',
+    ],
+    timeout: 15,
+)
 busctl = find_program('busctl')
 test(
     'dbus-api',
