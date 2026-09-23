@@ -2178,6 +2178,7 @@ static void app_destroy(struct app *app) {
     i3sd_dbus_runtime_destroy(app->dbus);
     i3sd_pipewire_destroy(app->pipewire);
     i3sd_nvidia_shutdown();
+    i3sd_collectors_shutdown();
     if (app->spawn.active) {
         i3sd_spawn_cancel(app);
     }

@@ -16,4 +16,7 @@ struct i3sd_collector_host {
 int i3sd_collect(lua_State *lua, const char *kind, int options,
                  const struct i3sd_collector_host *host);
 
+/* Release process-wide state retained by synchronous collectors. */
+void i3sd_collectors_shutdown(void);
+
 #endif

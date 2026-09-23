@@ -8,6 +8,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,6 +23,8 @@
 
 /* Collectors are synchronous bounded snapshots; the reactor calls them only
  * from an explicit Lua update callback. */
+static int cpu_stat_fd = -1;
+
 static int absolute_lua_index(lua_State *lua, int index) {
     if (index > 0 || index <= LUA_REGISTRYINDEX) {
         return index;
@@ -102,60 +105,135 @@ static bool option_boolean(lua_State *lua, int table, const char *name,
     return value;
 }
 
+static bool push_cpu_counters(lua_State *lua, const char *line, bool per_cpu,
+                              int *cpu_index, bool *aggregate_found,
+                              const struct i3sd_collector_host *host) {
+    char id[32];
+    unsigned long long values[10] = {0};
+    const int parsed =
+        sscanf(line, "%31s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+               id, &values[0], &values[1], &values[2], &values[3], &values[4],
+               &values[5], &values[6], &values[7], &values[8], &values[9]);
+    if (parsed != 11 || strncmp(id, "cpu", 3) != 0) {
+        return strncmp(line, "cpu", 3) == 0;
+    }
+    lua_newtable(lua);
+    lua_pushstring(lua, id);
+    lua_setfield(lua, -2, "id");
+    static const char *const names[10] = {
+        "user", "nice",    "system", "idle",  "iowait",
+        "irq",  "softirq", "steal",  "guest", "guest_nice",
+    };
+    for (size_t index = 0; index < 10; index++) {
+        host->push_uint64(lua, values[index]);
+        lua_setfield(lua, -2, names[index]);
+    }
+    if (strcmp(id, "cpu") == 0) {
+        lua_setfield(lua, -3, "aggregate");
+        *aggregate_found = true;
+        return per_cpu;
+    }
+    if (per_cpu) {
+        lua_rawseti(lua, -2, (*cpu_index)++);
+    } else {
+        lua_pop(lua, 1);
+    }
+    return true;
+}
+
 static int sample_cpu(lua_State *lua, int options,
                       const struct i3sd_collector_host *host) {
     static const char *const fields[] = {"per_cpu"};
     check_strict_table(lua, options, fields, 1);
     const bool per_cpu = option_boolean(lua, options, "per_cpu", false);
-    FILE *file = fopen("/proc/stat", "re");
-    if (file == NULL) {
+    if (cpu_stat_fd < 0) {
+        cpu_stat_fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
+    } else if (lseek(cpu_stat_fd, 0, SEEK_SET) < 0) {
+        /* Drop a stale descriptor so the next sample can reopen the source. */
+        const int saved_errno = errno;
+        close(cpu_stat_fd);
+        cpu_stat_fd = -1;
         lua_pushnil(lua);
-        push_error(lua, "unavailable", strerror(errno), "cpu", errno);
+        push_error(lua, "unavailable", strerror(saved_errno), "cpu",
+                   saved_errno);
+        return 2;
+    }
+    if (cpu_stat_fd < 0) {
+        const int saved_errno = errno;
+        lua_pushnil(lua);
+        push_error(lua, "unavailable", strerror(saved_errno), "cpu",
+                   saved_errno);
         return 2;
     }
     push_snapshot_header(lua, host, "proc-stat");
     lua_newtable(lua);
     int cpu_index = 1;
+    bool aggregate_found = false;
+    bool complete = false;
+    char input[512];
     char line[512];
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char id[32];
-        unsigned long long values[10] = {0};
-        const int parsed = sscanf(
-            line, "%31s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu", id,
-            &values[0], &values[1], &values[2], &values[3], &values[4],
-            &values[5], &values[6], &values[7], &values[8], &values[9]);
-        if (parsed != 11 || strncmp(id, "cpu", 3) != 0) {
-            if (strncmp(line, "cpu", 3) != 0) {
+    size_t line_length = 0;
+    while (!complete) {
+        ssize_t count;
+        do {
+            count = read(cpu_stat_fd, input, sizeof(input));
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            /* A fresh descriptor is safer than retaining a failed source. */
+            const int saved_errno = errno;
+            close(cpu_stat_fd);
+            cpu_stat_fd = -1;
+            lua_pop(lua, 2);
+            lua_pushnil(lua);
+            push_error(lua, "unavailable", strerror(saved_errno), "cpu",
+                       saved_errno);
+            return 2;
+        }
+        if (count == 0) {
+            if (line_length > 0) {
+                line[line_length] = '\0';
+                push_cpu_counters(lua, line, per_cpu, &cpu_index,
+                                  &aggregate_found, host);
+            }
+            break;
+        }
+        for (ssize_t index = 0; index < count; index++) {
+            if (input[index] == '\n') {
+                line[line_length] = '\0';
+                complete = !push_cpu_counters(lua, line, per_cpu, &cpu_index,
+                                              &aggregate_found, host);
+                line_length = 0;
+                if (complete) {
+                    break;
+                }
+            } else if (line_length + 1 < sizeof(line)) {
+                line[line_length++] = input[index];
+            } else {
+                complete = true;
+                aggregate_found = false;
                 break;
             }
-            continue;
-        }
-        lua_newtable(lua);
-        lua_pushstring(lua, id);
-        lua_setfield(lua, -2, "id");
-        static const char *const names[10] = {
-            "user", "nice",    "system", "idle",  "iowait",
-            "irq",  "softirq", "steal",  "guest", "guest_nice",
-        };
-        for (size_t index = 0; index < 10; index++) {
-            host->push_uint64(lua, values[index]);
-            lua_setfield(lua, -2, names[index]);
-        }
-        if (strcmp(id, "cpu") == 0) {
-            lua_setfield(lua, -3, "aggregate");
-        } else if (per_cpu) {
-            lua_rawseti(lua, -2, cpu_index++);
-        } else {
-            lua_pop(lua, 1);
         }
     }
-    fclose(file);
+    if (!aggregate_found) {
+        lua_pop(lua, 2);
+        lua_pushnil(lua);
+        push_error(lua, "unavailable", "incomplete /proc/stat", "cpu", 0);
+        return 2;
+    }
     if (per_cpu) {
         lua_setfield(lua, -2, "cpus");
     } else {
         lua_pop(lua, 1);
     }
     return 1;
+}
+
+void i3sd_collectors_shutdown(void) {
+    if (cpu_stat_fd >= 0) {
+        close(cpu_stat_fd);
+        cpu_stat_fd = -1;
+    }
 }
 
 static int sample_load(lua_State *lua, int options,
