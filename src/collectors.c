@@ -2,6 +2,7 @@
 
 #include "collectors.h"
 #include "i3sd/utf8.h"
+#include "nvidia.h"
 
 #include <lauxlib.h>
 
@@ -558,6 +559,9 @@ int i3sd_collect(lua_State *lua, const char *kind, int options,
     }
     if (strcmp(kind, "power_supply") == 0) {
         return sample_power_supply(lua, options, host);
+    }
+    if (strcmp(kind, "nvidia") == 0) {
+        return i3sd_nvidia_sample(lua, options, host);
     }
     return luaL_error(lua, "unknown collector '%s'", kind);
 }

@@ -472,6 +472,11 @@ The baseline v1 collector names/options/results are:
   string, and optional exact signed ``int64_t`` cdata fields ``energy_now_uwh``, ``energy_full_uwh``, ``energy_full_design_uwh``,
   ``charge_now_uah``, ``charge_full_uah``, ``charge_full_design_uah``, ``power_now_uw``, ``current_now_ua`` and
   ``voltage_now_uv``. Missing sysfs capabilities are ``nil`` rather than zero. Ordering is lexical by supply name.
+- When the ``nvidia`` feature is available, ``sample("nvidia", { index = integer? })`` samples one NVML device. ``index`` defaults
+  to zero. The result contains ``index``, ``uuid`` and optional ``name`` strings, plus optional numeric
+  ``gpu_utilization_percent``, ``memory_utilization_percent``, ``power_mw`` and ``temperature_celsius`` fields. The optional exact
+  unsigned cdata fields ``memory_total_bytes``, ``memory_used_bytes`` and ``memory_free_bytes`` are present together when supported.
+  An unavailable device capability is absent rather than represented as zero.
 - ``sample("hwmon", {})`` -> ordered ``sensors`` records containing ``chip``, ``name``, ``kind`` and exact signed ``int64_t`` cdata
   ``value_milli``;
   optional ``label`` is present when exported by the driver. ``kind`` is initially ``"temp"`` for baseline temperature support.

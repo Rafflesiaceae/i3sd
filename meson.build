@@ -33,6 +33,7 @@ yyjson = declare_dependency(
 xxhash = dependency('libxxhash')
 systemd = dependency('libsystemd')
 pipewire = dependency('libpipewire-0.3', required: false)
+nvml = dependency('nvidia-ml', required: false)
 
 conf = configuration_data()
 conf.set_quoted('I3SD_VERSION', meson.project_version())
@@ -43,6 +44,7 @@ conf.set_quoted(
 conf.set_quoted('I3SD_BUILD_EXECUTABLE', meson.current_build_dir() / 'i3sd')
 conf.set_quoted('I3SD_SOURCE_LUA_DIR', meson.current_source_dir() / 'lua')
 conf.set10('I3SD_HAVE_PIPEWIRE', pipewire.found())
+conf.set10('I3SD_HAVE_NVML', nvml.found())
 configure_file(output: 'config.h', configuration: conf)
 
 inc = include_directories('include', '.')
@@ -65,12 +67,16 @@ runtime_dependencies = [luajit, yyjson, xxhash, systemd, m]
 if pipewire.found()
     runtime_dependencies += pipewire
 endif
+if nvml.found()
+    runtime_dependencies += nvml
+endif
 
 executable(
     'i3sd',
     'src/collectors.c',
     'src/dbus.c',
     'src/main.c',
+    'src/nvidia.c',
     'src/pipewire.c',
     'src/power_profiles.c',
     'src/power_supply_events.c',
@@ -107,6 +113,14 @@ test(
     ],
 )
 test(
+    'nvidia-config-check',
+    find_program('tests/check_config.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/nvidia.lua',
+    ],
+)
+test(
     'example-configs',
     find_program('tests/check_examples.sh'),
     args: [meson.current_build_dir() / 'i3sd', meson.current_source_dir()],
@@ -138,6 +152,7 @@ install_data(
     'lua/i3sd/modules/cpu.lua',
     'lua/i3sd/modules/filesystem.lua',
     'lua/i3sd/modules/memory.lua',
+    'lua/i3sd/modules/nvidia.lua',
     'lua/i3sd/modules/pipewire_volume.lua',
     'lua/i3sd/modules/power_profiles.lua',
     'lua/i3sd/modules/systemd.lua',

@@ -8,6 +8,7 @@
 #include "i3sd/output.h"
 #include "i3sd/timer.h"
 #include "i3sd/utf8.h"
+#include "nvidia.h"
 #include "pipewire.h"
 #include "power_profiles.h"
 #include "power_supply_events.h"
@@ -902,6 +903,7 @@ static int lua_has_feature(lua_State *lua) {
         strcmp(feature, "psi") == 0 || strcmp(feature, "systemd") == 0 ||
         strcmp(feature, "power_profiles") == 0 ||
         strcmp(feature, "spawn") == 0 || strcmp(feature, "dbus") == 0 ||
+        (I3SD_HAVE_NVML && strcmp(feature, "nvidia") == 0) ||
         (I3SD_HAVE_PIPEWIRE && strcmp(feature, "pipewire") == 0);
     lua_pushboolean(lua, available);
     return 1;
@@ -923,6 +925,8 @@ static int lua_features(lua_State *lua) {
     lua_setfield(lua, -2, "spawn");
     lua_pushboolean(lua, true);
     lua_setfield(lua, -2, "dbus");
+    lua_pushboolean(lua, I3SD_HAVE_NVML);
+    lua_setfield(lua, -2, "nvidia");
     lua_pushboolean(lua, I3SD_HAVE_PIPEWIRE);
     lua_setfield(lua, -2, "pipewire");
     return 1;
@@ -2070,6 +2074,7 @@ static void app_destroy(struct app *app) {
     i3sd_power_supply_close(&app->power_supply);
     i3sd_dbus_runtime_destroy(app->dbus);
     i3sd_pipewire_destroy(app->pipewire);
+    i3sd_nvidia_shutdown();
     if (app->spawn.active) {
         i3sd_spawn_cancel(app);
     }

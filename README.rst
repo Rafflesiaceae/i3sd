@@ -14,7 +14,8 @@ Build
 
 The required development dependencies are LuaJIT, yyjson, xxHash and libsystemd.
 PipeWire development headers are optional and enable the event-driven default
-sink volume module.
+sink volume module. NVML development headers are optional and enable the
+NVIDIA GPU module.
 
 Configuration
 -------------
@@ -44,6 +45,7 @@ The high-level Lua modules can be loaded explicitly:
    local clock = require("i3sd.modules.clock")
    local battery = require("i3sd.modules.battery")
    local memory = require("i3sd.modules.memory")
+   local nvidia = require("i3sd.modules.nvidia")
    local pipewire_volume = require("i3sd.modules.pipewire_volume")
    local power_profiles = require("i3sd.modules.power_profiles")
    local systemd = require("i3sd.modules.systemd")
@@ -51,6 +53,7 @@ The high-level Lua modules can be loaded explicitly:
    clock { format = "%H:%M" }
    battery { show = "auto" }
    memory { warn_below = 20, critical_below = 10 }
+   nvidia {}
    pipewire_volume {}
    power_profiles {}
    systemd { scope = "both" }
@@ -83,6 +86,10 @@ selector entirely in Lua. Install ``rofi`` when using that module.
 
 The ``battery`` module refreshes immediately on Linux power-supply change
 events and keeps a slower periodic sample as a resynchronization fallback.
+
+The ``nvidia`` module polls NVML for GPU utilization and power draw. Its
+``format`` callback also receives memory utilization and usage, temperature,
+device name and UUID when the GPU exposes those values.
 
 D-Bus module API
 ----------------
