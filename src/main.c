@@ -119,6 +119,18 @@ static char *copy_bytes(const char *value, size_t len) {
     return copy;
 }
 
+static void debug_log(const struct app *app, const char *format, ...) {
+    if (!app->debug) {
+        return;
+    }
+    va_list arguments;
+    va_start(arguments, format);
+    fputs("i3sd: debug: ", stderr);
+    vfprintf(stderr, format, arguments);
+    fputc('\n', stderr);
+    va_end(arguments);
+}
+
 static void set_config_error(struct app *app, const char *format, ...) {
     char detail[I3SD_CONFIG_ERROR_MAX + 1];
     va_list arguments;
@@ -1314,63 +1326,98 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, LUA_REGISTRYINDEX, "i3sd.current_generation");
 }
 
-static bool read_config(struct app *app, struct i3sd_buffer *source,
-                        XXH128_hash_t *digest, struct stat *metadata) {
+enum config_read_result {
+    CONFIG_READ_OK,
+    CONFIG_READ_ERROR,
+    CONFIG_READ_CHANGED,
+};
+
+static enum config_read_result read_config(struct app *app,
+                                           struct i3sd_buffer *source,
+                                           XXH128_hash_t *digest,
+                                           struct stat *metadata,
+                                           bool report_error) {
     const char *path = app->config_path;
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) {
-        set_config_error(app, "cannot open %s: %s", path, strerror(errno));
-        fprintf(stderr, "i3sd: cannot open %s: %s\n", path, strerror(errno));
-        return false;
+        if (report_error) {
+            set_config_error(app, "cannot open %s: %s", path, strerror(errno));
+            fprintf(stderr, "i3sd: cannot open %s: %s\n", path, strerror(errno));
+        } else {
+            debug_log(app, "cannot inspect replacement config %s: %s", path,
+                      strerror(errno));
+        }
+        return CONFIG_READ_ERROR;
     }
+
     struct stat before, after;
     if (fstat(fd, &before) < 0 || !S_ISREG(before.st_mode) ||
         before.st_size < 0 || before.st_size > I3SD_MAX_CONFIG) {
-        set_config_error(app, "config must be a regular file of at most 1 MiB");
-        fprintf(stderr,
-                "i3sd: config must be a regular file of at most 1 MiB\n");
+        if (report_error) {
+            set_config_error(app, "config must be a regular file of at most 1 MiB");
+            fprintf(stderr,
+                    "i3sd: config must be a regular file of at most 1 MiB\n");
+        } else {
+            debug_log(app, "replacement config metadata is not usable yet");
+        }
         close(fd);
-        return false;
+        return CONFIG_READ_ERROR;
     }
+
     i3sd_buffer_clear(source);
     char bytes[16384];
     for (;;) {
         ssize_t count = read(fd, bytes, sizeof(bytes));
         if (count > 0) {
-            if (!i3sd_buffer_append(source, bytes, (size_t)count,
-                                    I3SD_MAX_CONFIG)) {
-                set_config_error(app,
-                                 "unable to buffer the configuration file");
+            if (!i3sd_buffer_append(source, bytes, (size_t)count, I3SD_MAX_CONFIG)) {
+                if (report_error) {
+                    set_config_error(app,
+                                     "unable to buffer the configuration file");
+                } else {
+                    debug_log(app, "unable to buffer replacement config");
+                }
                 close(fd);
-                return false;
+                return CONFIG_READ_ERROR;
             }
         } else if (count == 0) {
             break;
         } else if (errno != EINTR) {
-            set_config_error(app, "cannot read %s: %s", path, strerror(errno));
-            fprintf(stderr, "i3sd: cannot read %s: %s\n", path,
-                    strerror(errno));
+            if (report_error) {
+                set_config_error(app, "cannot read %s: %s", path, strerror(errno));
+                fprintf(stderr, "i3sd: cannot read %s: %s\n", path,
+                        strerror(errno));
+            } else {
+                debug_log(app, "cannot read replacement config %s: %s", path,
+                          strerror(errno));
+            }
             close(fd);
-            return false;
+            return CONFIG_READ_ERROR;
         }
     }
+
     if (fstat(fd, &after) < 0) {
-        set_config_error(app, "cannot inspect %s: %s", path, strerror(errno));
+        if (report_error) {
+            set_config_error(app, "cannot inspect %s: %s", path, strerror(errno));
+        } else {
+            debug_log(app, "cannot inspect replacement config %s: %s", path,
+                      strerror(errno));
+        }
         close(fd);
-        return false;
+        return CONFIG_READ_ERROR;
     }
     close(fd);
+
     if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
         before.st_size != after.st_size ||
         before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
         before.st_mtim.tv_nsec != after.st_mtim.tv_nsec) {
-        set_config_error(app, "configuration changed while it was being read");
-        fprintf(stderr, "i3sd: config changed while it was being read\n");
-        return false;
+        debug_log(app, "configuration snapshot changed while it was being read");
+        return CONFIG_READ_CHANGED;
     }
+
     *digest = XXH3_128bits(source->data, source->len);
     *metadata = after;
-    return true;
+    return CONFIG_READ_OK;
 }
 
 static bool running_from_build_tree(void) {
@@ -1508,10 +1555,18 @@ static struct generation *stage_generation(struct app *app, bool *fatal) {
     struct i3sd_buffer source = {0};
     XXH128_hash_t digest, validation_digest;
     struct stat metadata, validation_metadata;
-    if (!read_config(app, &source, &digest, &metadata)) {
+    enum config_read_result read_result =
+        read_config(app, &source, &digest, &metadata, true);
+    if (read_result != CONFIG_READ_OK) {
+        if (read_result == CONFIG_READ_CHANGED) {
+            debug_log(app, "deferring reload until the config write is stable");
+            app->reload_dirty = true;
+        }
         i3sd_buffer_destroy(&source);
         return NULL;
     }
+
+    debug_log(app, "staging configuration snapshot");
     struct generation *generation = create_generation(app);
     if (generation == NULL) {
         *fatal = true;
@@ -1545,20 +1600,26 @@ static struct generation *stage_generation(struct app *app, bool *fatal) {
           sizeof(generation->ordered[0]), compare_blocks);
 
     struct i3sd_buffer validation = {0};
-    bool stable = read_config(app, &validation, &validation_digest,
-                              &validation_metadata) &&
-                  XXH128_isEqual(digest, validation_digest) &&
-                  metadata.st_dev == validation_metadata.st_dev &&
-                  metadata.st_ino == validation_metadata.st_ino;
+    enum config_read_result validation_result =
+        read_config(app, &validation, &validation_digest, &validation_metadata,
+                    false);
+    bool stable =
+        validation_result == CONFIG_READ_OK &&
+        XXH128_isEqual(digest, validation_digest) &&
+        metadata.st_dev == validation_metadata.st_dev &&
+        metadata.st_ino == validation_metadata.st_ino;
     i3sd_buffer_destroy(&validation);
     i3sd_buffer_destroy(&source);
     if (!stable) {
-        set_config_error(app, "configuration became obsolete during staging");
-        fprintf(stderr, "i3sd: configuration became obsolete during staging\n");
+        debug_log(app, "discarding obsolete staged configuration");
         generation_destroy(generation);
-        app->reload_dirty = true;
+        if (validation_result != CONFIG_READ_ERROR) {
+            app->reload_dirty = true;
+        }
         return NULL;
     }
+
+    debug_log(app, "configuration snapshot staged successfully");
     return generation;
 }
 
@@ -1970,10 +2031,15 @@ static void handle_inotify(struct app *app) {
         while (offset < (size_t)count) {
             struct inotify_event *event =
                 (struct inotify_event *)(bytes + offset);
-            if ((event->mask & IN_Q_OVERFLOW) != 0 ||
-                (event->len > 0 &&
-                 strcmp(event->name, app->config_base) == 0)) {
+            if ((event->mask & IN_Q_OVERFLOW) != 0) {
+                debug_log(app, "inotify queue overflow; rechecking config");
                 app->reload_dirty = true;
+            } else if (event->len > 0 &&
+                       strcmp(event->name, app->config_base) == 0) {
+                debug_log(app, "config event mask=0x%08x", event->mask);
+                if ((event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) != 0) {
+                    app->reload_dirty = true;
+                }
             }
             offset += sizeof(*event) + event->len;
         }
@@ -2108,10 +2174,12 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
         !make_nonblocking(STDIN_FILENO) || !make_nonblocking(STDOUT_FILENO)) {
         return false;
     }
+    /* IN_CREATE/IN_ATTRIB can arrive while an editor still owns a partial file.
+     * Reload only after a writer closes or an atomic replacement lands. */
     app->config_watch =
         inotify_add_watch(app->inotify_fd, app->config_dir,
-                          IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE |
-                              IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
+                          IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE_SELF |
+                              IN_MOVE_SELF);
     if (app->config_watch < 0) {
         return false;
     }
@@ -2222,11 +2290,13 @@ static void run_event_loop(struct app *app) {
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
             app->reload_dirty = false;
+            debug_log(app, "reloading configuration");
             bool fatal = false;
             struct generation *candidate = stage_generation(app, &fatal);
             if (candidate != NULL) {
                 clear_config_error(app);
                 commit_generation(app, candidate);
+                debug_log(app, "configuration reload committed");
             } else if (fatal) {
                 fprintf(stderr,
                         "i3sd: unable to allocate configuration state\n");
@@ -2365,6 +2435,9 @@ int main(int argc, char **argv) {
         .config_watch = -1,
         .power_supply = {.fd = -1},
     };
+    const char *debug_env = getenv("DEBUG");
+    app.debug = debug_env != NULL && debug_env[0] != '\0' &&
+                strcmp(debug_env, "0") != 0;
     bool check_only = false;
     static const struct option options[] = {
         {"config", required_argument, NULL, 'c'},
