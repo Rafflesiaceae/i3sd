@@ -1190,8 +1190,12 @@ static int compare_blocks(const void *left_pointer, const void *right_pointer) {
     if (left->order != right->order) {
         return left->order > right->order ? -1 : 1;
     }
-    return left->declaration_order < right->declaration_order   ? -1
-           : left->declaration_order > right->declaration_order ? 1
+
+    /* i3bar renders the array from left to right. Blocks with the same order
+     * therefore use reverse declaration order so an implicit-order config reads
+     * naturally from top/right to bottom/left. */
+    return left->declaration_order > right->declaration_order   ? -1
+           : left->declaration_order < right->declaration_order ? 1
                                                                 : 0;
 }
 

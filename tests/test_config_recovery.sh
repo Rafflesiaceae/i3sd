@@ -51,6 +51,9 @@ while ! grep -q '"full_text":"recovered"' "$test_dir/output" && \
     sleep 0.02
 done
 grep -q '"full_text":"recovered"' "$test_dir/output"
+grep -q 'layout\[0\] block=bottom order=0 declaration=2' "$test_dir/error"
+grep -q 'layout\[1\] block=middle order=0 declaration=1' "$test_dir/error"
+grep -q 'layout\[2\] block=recovered order=0 declaration=0' "$test_dir/error"
 
 # Creating/truncating a config is not a reload boundary. Keep the previous
 # output while a writer still has the replacement file open.
