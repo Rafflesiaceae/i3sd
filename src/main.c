@@ -60,6 +60,11 @@
 #define I3SD_JSON_MAX_BYTES (1024U * 1024U)
 #define I3SD_JSON_MAX_DEPTH 64U
 
+enum setting_override {
+    SETTING_OVERRIDE_CLICK_EVENTS = 1U << 0,
+    SETTING_OVERRIDE_DEBUG = 1U << 1,
+};
+
 struct lua_context {
     struct block *block;
 };
@@ -85,8 +90,10 @@ struct lua_spawn_handle {
     uint64_t serial;
 };
 
-static const char protocol_prelude[] =
+static const char protocol_prelude_with_clicks[] =
     "{\"version\":1,\"click_events\":true}\n[\n";
+static const char protocol_prelude_without_clicks[] =
+    "{\"version\":1,\"click_events\":false}\n[\n";
 static const char context_metatable[] = "i3sd.context";
 static const char timer_metatable[] = "i3sd.timer";
 static const char systemd_handle_metatable[] = "i3sd.systemd_handle";
@@ -120,7 +127,7 @@ static char *copy_bytes(const char *value, size_t len) {
 }
 
 static void debug_log(const struct app *app, const char *format, ...) {
-    if (!app->debug) {
+    if (!app->settings.debug) {
         return;
     }
     va_list arguments;
@@ -273,6 +280,41 @@ static void check_strict_table(lua_State *lua, int index,
         }
         lua_pop(lua, 1);
     }
+}
+
+static void apply_cli_setting_overrides(const struct app *app,
+                                        struct global_settings *settings) {
+    if ((app->cli_setting_overrides & SETTING_OVERRIDE_CLICK_EVENTS) != 0) {
+        settings->click_events = app->cli_settings.click_events;
+    }
+    if ((app->cli_setting_overrides & SETTING_OVERRIDE_DEBUG) != 0) {
+        settings->debug = app->cli_settings.debug;
+    }
+}
+
+static void read_boolean_setting(lua_State *lua, int table, const char *field,
+                                 bool *value) {
+    lua_getfield(lua, table, field);
+    if (!lua_isnil(lua, -1)) {
+        if (!lua_isboolean(lua, -1)) {
+            luaL_error(lua, "%s must be a boolean", field);
+        }
+        *value = lua_toboolean(lua, -1);
+    }
+    lua_pop(lua, 1);
+}
+
+static int lua_configure(lua_State *lua) {
+    struct generation *generation = lua_touserdata(lua, lua_upvalueindex(1));
+    luaL_checktype(lua, 1, LUA_TTABLE);
+    static const char *const fields[] = {"click_events", "debug"};
+    check_strict_table(lua, 1, fields, sizeof(fields) / sizeof(fields[0]));
+
+    /* Keep candidate settings generation-local until the config commits. */
+    read_boolean_setting(lua, 1, "click_events",
+                         &generation->settings.click_events);
+    read_boolean_setting(lua, 1, "debug", &generation->settings.debug);
+    return 0;
 }
 
 static char *optional_text_field(lua_State *lua, int table, const char *field,
@@ -1289,6 +1331,9 @@ static void register_lua_api(struct generation *generation) {
     i3sd_pipewire_register_lua(lua);
 
     lua_newtable(lua);
+    lua_pushlightuserdata(lua, generation);
+    lua_pushcclosure(lua, lua_configure, 1);
+    lua_setfield(lua, -2, "configure");
     lua_pushinteger(lua, 1);
     lua_setfield(lua, -2, "api_version");
     lua_pushstring(lua, I3SD_VERSION);
@@ -1537,6 +1582,8 @@ static struct generation *create_generation(struct app *app) {
         return NULL;
     }
     generation->app = app;
+    generation->settings = app->default_settings;
+    apply_cli_setting_overrides(app, &generation->settings);
     generation->staging = true;
     generation->lua = luaL_newstate();
     if (generation->lua == NULL) {
@@ -1586,6 +1633,21 @@ static struct generation *stage_generation(struct app *app, bool *fatal) {
                          message == NULL ? "unknown Lua error" : message);
         fprintf(stderr, "i3sd: configuration failed: %s\n",
                 message == NULL ? "unknown Lua error" : message);
+        generation_destroy(generation);
+        i3sd_buffer_destroy(&source);
+        return NULL;
+    }
+    /* Command-line settings are final even when the config requests another
+     * value, so service launch arguments remain authoritative. */
+    apply_cli_setting_overrides(app, &generation->settings);
+    if (app->current != NULL &&
+        generation->settings.click_events != app->settings.click_events) {
+        set_config_error(app,
+                         "click_events cannot change after startup; restart "
+                         "i3sd to apply it");
+        fprintf(stderr,
+                "i3sd: click_events cannot change after startup; restart "
+                "i3sd to apply it\n");
         generation_destroy(generation);
         i3sd_buffer_destroy(&source);
         return NULL;
@@ -1701,9 +1763,14 @@ static bool add_poll_timer(struct block *block, uint64_t activation_ns) {
 
 static bool commit_generation(struct app *app, struct generation *candidate) {
     struct generation *old = app->current;
+    app->settings = candidate->settings;
     app->current = candidate;
     candidate->staging = false;
     const uint64_t activation_ns = monotonic_now_ns();
+
+    debug_log(app, "global settings click_events=%s debug=%s",
+              app->settings.click_events ? "true" : "false",
+              app->settings.debug ? "true" : "false");
 
     for (size_t index = 0; index < candidate->block_count; index++) {
         struct block *block = candidate->blocks[index];
@@ -1827,10 +1894,14 @@ static bool epoll_stdout(struct app *app, bool enabled) {
 }
 
 static bool flush_output(struct app *app) {
-    while (app->prelude_offset < sizeof(protocol_prelude) - 1) {
-        ssize_t written =
-            write(STDOUT_FILENO, protocol_prelude + app->prelude_offset,
-                  sizeof(protocol_prelude) - 1 - app->prelude_offset);
+    /* click_events is startup-only because this header is emitted once. */
+    const char *prelude = app->settings.click_events
+                              ? protocol_prelude_with_clicks
+                              : protocol_prelude_without_clicks;
+    const size_t prelude_length = strlen(prelude);
+    while (app->prelude_offset < prelude_length) {
+        ssize_t written = write(STDOUT_FILENO, prelude + app->prelude_offset,
+                                prelude_length - app->prelude_offset);
         if (written > 0) {
             app->prelude_offset += (size_t)written;
             continue;
@@ -2175,7 +2246,8 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
     app->signal_fd = signalfd(-1, signal_mask, SFD_NONBLOCK | SFD_CLOEXEC);
     app->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (app->epoll_fd < 0 || app->signal_fd < 0 || app->inotify_fd < 0 ||
-        !make_nonblocking(STDIN_FILENO) || !make_nonblocking(STDOUT_FILENO)) {
+        !make_nonblocking(STDOUT_FILENO) ||
+        (app->settings.click_events && !make_nonblocking(STDIN_FILENO))) {
         return false;
     }
     /* IN_CREATE/IN_ATTRIB can arrive while an editor still owns a partial file.
@@ -2215,8 +2287,9 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
     app->spawn.output_fd = -1;
     app->spawn.callback_ref = LUA_NOREF;
     return add_epoll_fd(app, app->signal_fd, EPOLLIN, SOURCE_SIGNAL) &&
-           add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
-                        SOURCE_STDIN) &&
+           (!app->settings.click_events ||
+            add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
+                         SOURCE_STDIN)) &&
            add_epoll_fd(app, app->inotify_fd, EPOLLIN, SOURCE_INOTIFY) &&
            epoll_stdout(app, true);
 }
@@ -2315,7 +2388,10 @@ static void run_event_loop(struct app *app) {
                 break;
             }
         }
-        if (app->prelude_offset < sizeof(protocol_prelude) - 1 ||
+        const size_t prelude_length = strlen(
+            app->settings.click_events ? protocol_prelude_with_clicks
+                                       : protocol_prelude_without_clicks);
+        if (app->prelude_offset < prelude_length ||
             i3sd_output_has_pending(&app->output)) {
             flush_output(app);
         }
@@ -2412,7 +2488,9 @@ static void print_help(FILE *stream) {
             "Usage: i3sd [OPTIONS]\n"
             "  -c, --config FILE  configuration file\n"
             "      --check        validate configuration without output\n"
-            "      --debug        enable lifecycle diagnostics\n"
+            "      --[no-]click-events\n"
+            "                     enable or disable i3bar click handling\n"
+            "      --[no-]debug   enable or disable lifecycle diagnostics\n"
             "      --version      print version\n"
             "  -h, --help         show this help\n");
 }
@@ -2438,16 +2516,21 @@ int main(int argc, char **argv) {
         .inotify_fd = -1,
         .config_watch = -1,
         .power_supply = {.fd = -1},
+        .default_settings = {.click_events = true},
     };
     const char *debug_env = getenv("DEBUG");
-    app.debug = debug_env != NULL && debug_env[0] != '\0' &&
-                strcmp(debug_env, "0") != 0;
+    app.default_settings.debug = debug_env != NULL && debug_env[0] != '\0' &&
+                                 strcmp(debug_env, "0") != 0;
+    app.settings = app.default_settings;
     bool check_only = false;
     static const struct option options[] = {
         {"config", required_argument, NULL, 'c'},
         {"check", no_argument, NULL, 1000},
         {"debug", no_argument, NULL, 1001},
         {"version", no_argument, NULL, 1002},
+        {"click-events", no_argument, NULL, 1003},
+        {"no-click-events", no_argument, NULL, 1004},
+        {"no-debug", no_argument, NULL, 1005},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -2466,12 +2549,25 @@ int main(int argc, char **argv) {
             check_only = true;
             break;
         case 1001:
-            app.debug = true;
+            app.cli_settings.debug = true;
+            app.cli_setting_overrides |= SETTING_OVERRIDE_DEBUG;
             break;
         case 1002:
             printf("i3sd %s\n", I3SD_VERSION);
             app_destroy(&app);
             return EXIT_SUCCESS;
+        case 1003:
+            app.cli_settings.click_events = true;
+            app.cli_setting_overrides |= SETTING_OVERRIDE_CLICK_EVENTS;
+            break;
+        case 1004:
+            app.cli_settings.click_events = false;
+            app.cli_setting_overrides |= SETTING_OVERRIDE_CLICK_EVENTS;
+            break;
+        case 1005:
+            app.cli_settings.debug = false;
+            app.cli_setting_overrides |= SETTING_OVERRIDE_DEBUG;
+            break;
         default:
             print_help(stderr);
             app_destroy(&app);
@@ -2491,6 +2587,7 @@ int main(int argc, char **argv) {
         app_destroy(&app);
         return EXIT_FAILURE;
     }
+    apply_cli_setting_overrides(&app, &app.settings);
 
     i3sd_output_init(&app.output);
     /* Staging may register lazy PipeWire subscriptions before epoll exists. */
@@ -2527,6 +2624,9 @@ int main(int argc, char **argv) {
     } else {
         clear_config_error(&app);
     }
+    /* Runtime descriptors must follow the staged startup settings before the
+     * generation is made visible by commit_generation(). */
+    app.settings = initial->settings;
     if (!initialize_runtime(&app, &signal_mask)) {
         fprintf(stderr, "i3sd: runtime initialization failed: %s\n",
                 strerror(errno));

@@ -24,6 +24,11 @@ The default configuration is ``${XDG_CONFIG_HOME:-$HOME/.config}/i3sd.lua``. A m
 
 .. code:: lua
 
+   i3sd.configure {
+       click_events = false,
+       debug = false,
+   }
+
    block {
        name = "clock",
        interval = 1,
@@ -37,6 +42,15 @@ Validate it without activating runtime sources or writing the i3bar protocol:
 .. code:: console
 
    i3sd --check -c ~/.config/i3sd.lua
+
+``i3sd.configure`` accepts the process-wide ``click_events`` and ``debug``
+booleans. Click handling defaults to enabled and debug logging defaults to the
+``DEBUG`` environment setting. The equivalent command-line switches are
+``--click-events`` / ``--no-click-events`` and ``--debug`` / ``--no-debug``;
+an explicit command-line switch takes precedence over the configuration and
+environment. Because the i3bar protocol header is written only once,
+``click_events`` can only change on process startup. Disabling it both advertises
+``"click_events":false`` to i3bar and stops i3sd from monitoring stdin.
 
 The high-level Lua modules can be loaded explicitly:
 

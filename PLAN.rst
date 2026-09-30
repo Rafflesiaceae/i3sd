@@ -1859,7 +1859,12 @@ Minimum command-line surface:
   synchronous validation, not proof of later asynchronous peer/service/broker availability. It is also not a sandbox: trusted
   configuration/LuaJIT FFI may itself perform arbitrary side effects;
 - ``--version`` and ``--help``;
-- optional ``--debug`` for verbose lifecycle/source diagnostics on stderr.
+- ``--click-events`` / ``--no-click-events``: enable or disable i3bar click handling;
+- ``--debug`` / ``--no-debug``: enable or disable verbose lifecycle/source diagnostics on stderr.
+
+The same process-wide booleans are configured through ``i3sd.configure { click_events = ..., debug = ... }``. Explicit command-line
+values override configuration values. ``click_events`` is startup-only because the protocol header is immutable; a reload that tries
+to change it is rejected and requires a process restart.
 
 Normal informational/debug logging goes to stderr only. Repeated source/reconnect errors should be rate-limited or state-change
 logged so a broken optional integration cannot create an unbounded log storm.
@@ -1871,8 +1876,8 @@ close the intentionally infinite JSON outer array.
 i3bar Output Protocol
 ---------------------
 
-Emit a valid i3bar protocol header with click events enabled. The header JSON is followed by exactly one ``\n`` before any outer-array
-byte:
+Emit a valid i3bar protocol header with the configured click-event setting. The header JSON is followed by exactly one ``\n`` before
+any outer-array byte:
 
 .. code:: json
 
@@ -1896,8 +1901,9 @@ The stream remains open for the process lifetime.
 
 Only required i3bar fields and semantics need to be supported.
 
-Because ``click_events`` is permanently enabled in the one-time header, stdin remains drained for the process lifetime even
-if the current configuration has no click handlers; a later reload may add them without changing the header.
+When ``click_events`` is enabled in the one-time header, stdin remains drained for the process lifetime even if the current
+configuration has no click handlers; a later reload may add them without changing the header. When disabled, stdin is not made
+nonblocking or registered with the reactor.
 
 stdout and Backpressure
 -----------------------

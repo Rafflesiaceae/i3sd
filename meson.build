@@ -143,6 +143,16 @@ test(
     ],
     timeout: 15,
 )
+test(
+    'global-settings',
+    find_program('tests/test_global_settings.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/global-settings.lua',
+        meson.current_source_dir() / 'tests/config/basic.lua',
+    ],
+    timeout: 15,
+)
 busctl = find_program('busctl')
 test(
     'dbus-api',

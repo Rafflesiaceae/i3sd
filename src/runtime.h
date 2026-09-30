@@ -170,6 +170,11 @@ struct block {
     struct i3sd_buffer fragment;
 };
 
+struct global_settings {
+    bool click_events;
+    bool debug;
+};
+
 struct generation {
     struct app *app;
     lua_State *lua;
@@ -185,6 +190,7 @@ struct generation {
     size_t subscription_count;
     int push_uint64_ref;
     int push_int64_ref;
+    struct global_settings settings;
     bool staging;
 };
 
@@ -217,6 +223,10 @@ struct app {
     struct i3sd_buffer frame;
     struct identity identities[4096];
     size_t identity_count;
+    struct global_settings settings;
+    struct global_settings default_settings;
+    struct global_settings cli_settings;
+    unsigned int cli_setting_overrides;
     uint64_t next_registration_cookie;
     size_t prelude_offset;
     uint64_t last_render_ns;
@@ -226,7 +236,6 @@ struct app {
     bool render_dirty;
     bool reload_dirty;
     bool running;
-    bool debug;
 };
 
 /* Event sources use these callbacks to preserve block fault isolation. */
