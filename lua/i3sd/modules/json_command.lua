@@ -7,6 +7,26 @@ local allowed = {
 }
 
 local STARTUP_RETRY_SECONDS = 0.1
+local MAX_NAME_BYTES = 256
+
+-- Each configuration generation loads a fresh module, so names reset on reload.
+local used_names = {}
+
+local function command_name(label)
+    local base = ("json_command_" .. label):sub(1, MAX_NAME_BYTES)
+    local name = base
+    local number = 1
+
+    -- Reserve room for the suffix and check it against all previously used names.
+    while used_names[name] do
+        number = number + 1
+        local suffix = "_" .. number
+        name = base:sub(1, MAX_NAME_BYTES - #suffix) .. suffix
+    end
+
+    used_names[name] = true
+    return name
+end
 
 local function check_options(options)
     for key in pairs(options) do
@@ -52,7 +72,8 @@ return function(options)
     options = options or {}
     check_options(options)
 
-    local label = options.key or "json_command"
+    local label = table.concat(options.command, "_"):gsub("[^%w]", "_"):lower()
+        :gsub("_+", "_")
     local startup_retry
 
     local function show_error(ctx, message)
@@ -90,7 +111,7 @@ return function(options)
     end
 
     block {
-        name = "json_command",
+        name = command_name(label),
         key = options.key,
         order = options.order or 0,
         interval = options.interval,
