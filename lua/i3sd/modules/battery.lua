@@ -92,18 +92,14 @@ return function(options)
     end
 
     local function refresh(ctx)
-        local snapshot = ctx:sample("power_supply")
+        -- Filtering in the collector skips the sysfs reads of AC adapters
+        -- and USB-C ports, which this module never shows.
+        local snapshot = ctx:sample("power_supply", { type = "Battery" })
         if snapshot == nil then
             ctx:set { full_text = "" }
             return
         end
-        local battery
-        for _, supply in ipairs(snapshot.supplies) do
-            if supply.type == "Battery" then
-                battery = supply
-                break
-            end
-        end
+        local battery = snapshot.supplies[1]
         if battery == nil then
             ctx:set { full_text = "" }
             return

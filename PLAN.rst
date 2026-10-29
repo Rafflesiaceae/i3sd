@@ -480,10 +480,11 @@ The baseline v1 collector names/options/results are:
   ``read_ios``, ``write_ios``, ``io_time_ms`` and
   ``weighted_io_time_ms``. Byte counters use the kernel block-statistics 512-byte sector definition. Explicit ``devices`` preserves
   caller order; physical mode uses deterministic lexical device-name order.
-- ``sample("power_supply", {})`` -> ordered ``supplies`` records with mandatory ``name`` and ``type`` strings, optional ``status``
+- ``sample("power_supply", { type = string? })`` -> ordered ``supplies`` records with mandatory ``name`` and ``type`` strings, optional ``status``
   string, and optional exact signed ``int64_t`` cdata fields ``energy_now_uwh``, ``energy_full_uwh``, ``energy_full_design_uwh``,
   ``charge_now_uah``, ``charge_full_uah``, ``charge_full_design_uah``, ``power_now_uw``, ``current_now_ua`` and
-  ``voltage_now_uv``. Missing sysfs capabilities are ``nil`` rather than zero. Ordering is lexical by supply name.
+  ``voltage_now_uv``. Missing sysfs capabilities are ``nil`` rather than zero. Ordering is lexical by supply name. A ``type`` such as
+  ``"Battery"`` keeps only supplies of that kernel type and skips reading the attributes of all others.
 - When the ``nvidia`` feature is available, ``sample("nvidia", { index = integer? })`` samples one NVML device. ``index`` defaults
   to zero. The result contains ``index``, ``uuid`` and optional ``name`` strings, plus optional numeric
   ``gpu_utilization_percent``, ``memory_utilization_percent``, ``power_mw`` and ``temperature_celsius`` fields. The optional exact

@@ -485,15 +485,21 @@ static bool read_supply_text(const char *name, const char *field, char *value,
     if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
         return false;
     }
-    FILE *file = fopen(path, "re");
-    if (file == NULL) {
+    /* A sysfs attribute is produced in full by its first read, so a plain
+     * read avoids the stdio buffer allocation and fstat of fopen. */
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         return false;
     }
-    const bool read = fgets(value, (int)value_size, file) != NULL;
-    fclose(file);
-    if (!read) {
+    ssize_t count;
+    do {
+        count = read(fd, value, value_size - 1);
+    } while (count < 0 && errno == EINTR);
+    close(fd);
+    if (count <= 0) {
         return false;
     }
+    value[count] = '\0';
     value[strcspn(value, "\r\n")] = '\0';
     return valid_text(value, strlen(value), value_size - 1);
 }
@@ -526,7 +532,20 @@ static void set_optional_supply_counter(
 
 static int sample_power_supply(lua_State *lua, int options,
                                const struct i3sd_collector_host *host) {
-    check_strict_table(lua, options, NULL, 0);
+    static const char *const fields[] = {"type"};
+    check_strict_table(lua, options, fields, 1);
+    /* An optional type filter skips the attribute reads of other supplies,
+     * such as USB-C ports when only the battery matters. */
+    const char *wanted_type = NULL;
+    lua_getfield(lua, options, "type");
+    if (!lua_isnil(lua, -1)) {
+        if (lua_type(lua, -1) != LUA_TSTRING) {
+            luaL_error(lua, "power_supply type must be a string");
+        }
+        wanted_type = lua_tostring(lua, -1);
+    }
+    /* The options table keeps the string alive while it is used. */
+    lua_pop(lua, 1);
     DIR *directory = opendir("/sys/class/power_supply");
     if (directory == NULL) {
         const int saved_errno = errno;
@@ -574,7 +593,8 @@ static int sample_power_supply(lua_State *lua, int options,
     size_t supply_index = 1;
     for (size_t index = 0; index < name_count; index++) {
         char type[64];
-        if (!read_supply_text(names[index], "type", type, sizeof(type))) {
+        if (!read_supply_text(names[index], "type", type, sizeof(type)) ||
+            (wanted_type != NULL && strcmp(type, wanted_type) != 0)) {
             continue;
         }
         lua_newtable(lua);

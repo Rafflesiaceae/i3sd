@@ -20,6 +20,15 @@ block {
     name = "first",
     order = 1,
     update = function(ctx)
+        -- The power-supply type filter keeps only matching supplies; machines
+        -- without power supplies report an error value instead.
+        local ok, err = pcall(ctx.sample, ctx, "power_supply", { type = 1 })
+        assert(not ok and err:find("type must be a string", 1, true), err)
+        local supplies = ctx:sample("power_supply", { type = "Battery" })
+        for _, supply in ipairs(supplies and supplies.supplies or {}) do
+            assert(supply.type == "Battery", supply.name)
+        end
+
         local memory = assert(ctx:sample("memory"))
         ctx:set {
             full_text = ("memory:%d"):format(memory.mem_total),
