@@ -62,7 +62,10 @@ i3sd_pid=$!
 wait_for_header "$test_dir/enabled-output"
 kill -0 "$i3sd_pid"
 grep -q '"click_events":true' "$test_dir/enabled-output"
-! grep -q 'i3sd: debug:' "$test_dir/enabled-error"
+# A plain "! command" is exempt from set -e, so fail explicitly.
+if grep -q 'i3sd: debug:' "$test_dir/enabled-error"; then
+    exit 1
+fi
 kill -TERM "$i3sd_pid"
 wait "$i3sd_pid"
 i3sd_pid=""

@@ -125,8 +125,13 @@ done
 grep -q '"full_text":"fresh"' "$test_dir/output"
 test "$(grep -c '"name":"i3sd-error"' "$test_dir/output" || true)" -eq "$error_frames"
 test "$(grep -c '"full_text":"stale"' "$test_dir/output" || true)" -eq 0
-! grep -q 'configuration changed while it was being read' "$test_dir/error"
-! grep -q 'configuration became obsolete during staging' "$test_dir/error"
+# A plain "! command" is exempt from set -e, so fail explicitly.
+if grep -q 'configuration changed while it was being read' "$test_dir/error"; then
+    exit 1
+fi
+if grep -q 'configuration became obsolete during staging' "$test_dir/error"; then
+    exit 1
+fi
 
 kill -TERM "$i3sd_pid"
 wait "$i3sd_pid"
