@@ -169,6 +169,16 @@ test(
     timeout: 15,
 )
 test(
+    'timer-reclaim',
+    find_program('tests/test_timer_reclaim.sh'),
+    args: [
+        i3sd,
+        meson.current_source_dir() / 'tests/config/timer-reclaim.lua',
+        meson.current_source_dir() / 'tests/config/timer-fault.lua',
+    ],
+    timeout: 30,
+)
+test(
     'config-recovery',
     find_program('tests/test_config_recovery.sh'),
     args: [

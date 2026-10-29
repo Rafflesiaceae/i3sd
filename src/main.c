@@ -1204,16 +1204,80 @@ static int lua_context_watch_directory(lua_State *lua) {
     return 0;
 }
 
+/* Realtime and monotonic timers live on different heaps. */
+static struct i3sd_timer_heap *timer_heap_of(struct logical_timer *timer) {
+    struct app *app = timer->block->generation->app;
+    return timer->realtime ? &app->realtime_heap : &app->timer_heap;
+}
+
+void i3sd_release_timer(struct logical_timer *timer) {
+    struct generation *generation = timer->block->generation;
+    i3sd_timer_cancel(timer_heap_of(timer), &timer->timer);
+    /* A surviving handle turns into a no-op; cancel() checks for NULL. */
+    if (timer->handle != NULL) {
+        timer->handle->timer = NULL;
+    }
+    if (timer->prev != NULL) {
+        timer->prev->next = timer->next;
+    } else {
+        generation->timers = timer->next;
+    }
+    if (timer->next != NULL) {
+        timer->next->prev = timer->prev;
+    }
+    /* Poll timers share the block's update reference, which the block
+     * keeps owning after a fault releases its poll timer. */
+    if (timer->callback_ref != timer->block->update_ref) {
+        luaL_unref(generation->lua, LUA_REGISTRYINDEX, timer->callback_ref);
+    }
+    generation->timer_count--;
+    free(timer);
+}
+
+static void cancel_lua_timer(struct logical_timer *timer) {
+    i3sd_timer_cancel(timer_heap_of(timer), &timer->timer);
+    timer->cancelled = true;
+    /* A timer cancelling itself from its own callback is still on the
+     * dispatcher's stack, which releases it once the callback returns. */
+    if (!timer->running) {
+        i3sd_release_timer(timer);
+    }
+}
+
 static int lua_timer_cancel(lua_State *lua) {
     struct lua_timer_handle *handle = luaL_checkudata(lua, 1, timer_metatable);
     if (handle->timer != NULL && !handle->timer->cancelled) {
-        struct app *app = handle->timer->block->generation->app;
-        i3sd_timer_cancel(handle->timer->realtime ? &app->realtime_heap
-                                                  : &app->timer_heap,
-                          &handle->timer->timer);
-        handle->timer->cancelled = true;
+        cancel_lua_timer(handle->timer);
     }
     return 0;
+}
+
+/* Collecting a handle cancels its timer and detaches it, because a timer
+ * that is still running must not write to the freed handle on release. */
+static int lua_timer_gc(lua_State *lua) {
+    struct lua_timer_handle *handle = luaL_checkudata(lua, 1, timer_metatable);
+    struct logical_timer *timer = handle->timer;
+    if (timer == NULL) {
+        return 0;
+    }
+    timer->handle = NULL;
+    handle->timer = NULL;
+    if (!timer->cancelled) {
+        cancel_lua_timer(timer);
+    }
+    return 0;
+}
+
+/* Prepend a timer to its generation, which owns it until release. */
+static void link_timer(struct generation *generation,
+                       struct logical_timer *timer) {
+    timer->prev = NULL;
+    timer->next = generation->timers;
+    if (generation->timers != NULL) {
+        generation->timers->prev = timer;
+    }
+    generation->timers = timer;
+    generation->timer_count++;
 }
 
 static bool seconds_to_ns(lua_State *lua, int index, bool allow_zero,
@@ -1267,12 +1331,11 @@ static int create_lua_timer(lua_State *lua, bool repeating) {
     }
     lua_pushvalue(lua, 3);
     timer->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
-    timer->next = generation->timers;
-    generation->timers = timer;
-    generation->timer_count++;
+    link_timer(generation, timer);
 
     struct lua_timer_handle *handle = lua_newuserdata(lua, sizeof(*handle));
     handle->timer = timer;
+    timer->handle = handle;
     luaL_getmetatable(lua, timer_metatable);
     lua_setmetatable(lua, -2);
     return 1;
@@ -1316,12 +1379,11 @@ static int lua_context_at_realtime(lua_State *lua) {
     }
     lua_pushvalue(lua, 3);
     timer->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
-    timer->next = generation->timers;
-    generation->timers = timer;
-    generation->timer_count++;
+    link_timer(generation, timer);
 
     struct lua_timer_handle *handle = lua_newuserdata(lua, sizeof(*handle));
     handle->timer = timer;
+    timer->handle = handle;
     luaL_getmetatable(lua, timer_metatable);
     lua_setmetatable(lua, -2);
     return 1;
@@ -2063,7 +2125,7 @@ static void register_lua_api(struct generation *generation) {
     lua_pushcfunction(lua, lua_timer_cancel);
     lua_setfield(lua, -2, "cancel");
     lua_setfield(lua, -2, "__index");
-    lua_pushcfunction(lua, lua_timer_cancel);
+    lua_pushcfunction(lua, lua_timer_gc);
     lua_setfield(lua, -2, "__gc");
     lua_pop(lua, 1);
 
@@ -2291,11 +2353,15 @@ static void generation_destroy(struct generation *generation) {
     struct logical_timer *timer = generation->timers;
     while (timer != NULL) {
         if (timer->timer.active) {
-            i3sd_timer_cancel(timer->realtime ? &generation->app->realtime_heap
-                                              : &generation->app->timer_heap,
-                              &timer->timer);
+            i3sd_timer_cancel(timer_heap_of(timer), &timer->timer);
         }
         timer->cancelled = true;
+        /* Detach handles so finalizers run by lua_close neither release
+         * timers nor touch the registry of a closing state. */
+        if (timer->handle != NULL) {
+            timer->handle->timer = NULL;
+            timer->handle = NULL;
+        }
         timer = timer->next;
     }
     for (struct clock_observer *observer = generation->clock_observers;
@@ -2497,8 +2563,10 @@ void i3sd_fault_block(struct block *block) {
     i3sd_spawn_cancel_owned(generation->app, generation, block);
     for (struct logical_timer *timer = generation->timers; timer != NULL;
          timer = timer->next) {
+        /* Only mark them: a running timer is still on the dispatcher's
+         * stack, and the rest is freed with the generation. */
         if (timer->block == block && !timer->cancelled) {
-            i3sd_timer_cancel(&generation->app->timer_heap, &timer->timer);
+            i3sd_timer_cancel(timer_heap_of(timer), &timer->timer);
             timer->cancelled = true;
         }
     }
@@ -2553,9 +2621,7 @@ static bool add_poll_timer(struct block *block, uint64_t activation_ns) {
     timer->callback_ref = block->update_ref;
     timer->delay_ns = interval_ns;
     timer->timer.interval_ns = interval_ns;
-    timer->next = block->generation->timers;
-    block->generation->timers = timer;
-    block->generation->timer_count++;
+    link_timer(block->generation, timer);
     return i3sd_timer_add(&block->generation->app->timer_heap, &timer->timer,
                           activation_ns + interval_ns, interval_ns, timer);
 }
@@ -3078,15 +3144,23 @@ static void dispatch_timers(struct app *app, uint64_t now_ns) {
             timer->block->faulted) {
             continue;
         }
-        if (!call_block_ref(timer->block, timer->callback_ref, "timer", 0)) {
+        timer->running = true;
+        const bool called =
+            call_block_ref(timer->block, timer->callback_ref, "timer", 0);
+        timer->running = false;
+        if (!called) {
             i3sd_fault_block(timer->block);
-            continue;
-        }
-        if (native->interval_ns != 0 && !timer->cancelled &&
-            !timer->block->faulted &&
-            !i3sd_timer_reschedule_fixed(&app->timer_heap, native, now_ns)) {
+        } else if (native->interval_ns != 0 && !timer->cancelled &&
+                   !timer->block->faulted &&
+                   !i3sd_timer_reschedule_fixed(&app->timer_heap, native,
+                                                now_ns)) {
             fprintf(stderr, "i3sd: repeating timer overflow\n");
             i3sd_fault_block(timer->block);
+        }
+        /* One-shot timers are done once they ran. Timers cancelled while
+         * running, including by a fault, were left to this dispatcher. */
+        if (native->interval_ns == 0 || timer->cancelled) {
+            i3sd_release_timer(timer);
         }
     }
 }

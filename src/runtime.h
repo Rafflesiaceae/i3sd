@@ -98,13 +98,19 @@ struct block_state {
 struct logical_timer {
     struct i3sd_timer timer;
     struct logical_timer *next;
+    struct logical_timer *prev;
     struct block *block;
+    /* The Lua handle of ctx:after, ctx:every and ctx:at_realtime timers, or
+     * NULL for block poll timers and once the handle was collected. */
+    struct lua_timer_handle *handle;
     int callback_ref;
     uint64_t delay_ns;
     /* Realtime timers fire once at realtime_ns on the realtime heap. */
     uint64_t realtime_ns;
     bool realtime;
     bool cancelled;
+    /* Set while the callback runs; release is deferred until it returns. */
+    bool running;
 };
 
 /* A block callback for discontinuous CLOCK_REALTIME changes. */
@@ -335,6 +341,10 @@ struct app {
 /* Event sources use these callbacks to preserve block fault isolation. */
 void i3sd_fault_block(struct block *block);
 void i3sd_log_lua_error(struct block *block, const char *phase);
+
+/* Free a Lua timer that fired once or was cancelled, so configurations that
+ * keep rescheduling one-shot timers stay below I3SD_MAX_TIMERS. */
+void i3sd_release_timer(struct logical_timer *timer);
 
 /* Item access for native producers. Items stay sorted by id, compared as
  * byte strings, and render requests follow the usual live-generation rule. */

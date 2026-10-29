@@ -150,10 +150,15 @@ static void dispatch_due(struct app *app) {
         lua_State *lua = block->generation->lua;
         lua_rawgeti(lua, LUA_REGISTRYINDEX, timer->callback_ref);
         lua_rawgeti(lua, LUA_REGISTRYINDEX, block->context_ref);
-        if (lua_pcall(lua, 1, 0, 0) != 0) {
+        timer->running = true;
+        const int status = lua_pcall(lua, 1, 0, 0);
+        timer->running = false;
+        if (status != 0) {
             i3sd_log_lua_error(block, "realtime timer");
             i3sd_fault_block(block);
         }
+        /* Realtime timers fire once; schedules re-arm with a new timer. */
+        i3sd_release_timer(timer);
     }
 }
 
