@@ -29,6 +29,9 @@
 #define I3SD_POWER_PROFILE_LIMIT 16U
 #define I3SD_POWER_PROFILE_NAME_LIMIT 63U
 
+/* Child processes that may run at once across all blocks. */
+#define I3SD_MAX_SPAWNS 8
+
 enum source_cookie {
     SOURCE_SIGNAL = 1,
     SOURCE_STDIN = 2,
@@ -37,10 +40,12 @@ enum source_cookie {
     SOURCE_SYSTEM_BUS = 5,
     SOURCE_USER_BUS = 6,
     SOURCE_POWER_PROFILES = 7,
-    SOURCE_SPAWN = 8,
-    SOURCE_PIPEWIRE = 9,
-    SOURCE_POWER_SUPPLY = 10,
-    SOURCE_FIXED_MAX = SOURCE_POWER_SUPPLY,
+    SOURCE_PIPEWIRE = 8,
+    SOURCE_POWER_SUPPLY = 9,
+    /* Each child process slot owns one cookie for its output pipe. */
+    SOURCE_SPAWN_FIRST = 10,
+    SOURCE_SPAWN_LAST = SOURCE_SPAWN_FIRST + I3SD_MAX_SPAWNS - 1,
+    SOURCE_FIXED_MAX = SOURCE_SPAWN_LAST,
 };
 
 struct app;
@@ -143,12 +148,14 @@ struct power_supply_source {
 };
 
 struct spawned_process {
-    pid_t pid;
+    pid_t pid; /* 0 once reaped; the child also leads its process group */
     int output_fd;
     struct block *block;
     int callback_ref;
     uint64_t serial;
     size_t output_limit;
+    /* Monotonic kill deadline, or 0 without a timeout. */
+    uint64_t deadline_ns;
     int wait_status;
     struct i3sd_buffer output;
     bool active;
@@ -156,6 +163,9 @@ struct spawned_process {
     bool exited;
     bool overflow;
     bool io_error;
+    bool timed_out;
+    /* Completed without a child (exec failure); finished by the loop. */
+    bool finish_pending;
 };
 
 /* One i3bar object rendered by a block, with its cached wire fragment. */
@@ -282,7 +292,7 @@ struct app {
     struct power_supply_source power_supply;
     struct i3sd_pipewire_source *pipewire;
     struct i3sd_dbus_runtime *dbus;
-    struct spawned_process spawn;
+    struct spawned_process spawns[I3SD_MAX_SPAWNS];
     uint64_t next_spawn_serial;
     struct i3sd_buffer frame;
     struct identity identities[4096];

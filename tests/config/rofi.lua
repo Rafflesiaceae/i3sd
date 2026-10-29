@@ -32,3 +32,63 @@ block {
         end))
     end,
 }
+
+-- Process-wide child limits: timeouts kill the whole process group, missing
+-- executables complete asynchronously and at most eight children run.
+local limits_started = false
+local outcomes = {}
+
+local function record(ctx, name)
+    outcomes[#outcomes + 1] = name
+    if #outcomes == 2 then
+        table.sort(outcomes)
+        ctx:set { full_text = "limits:" .. table.concat(outcomes, ",") }
+    end
+end
+
+block {
+    name = "limits",
+    update = function(ctx)
+        if limits_started then
+            return
+        end
+        -- The grandchild keeps stdout open, so completion relies on the
+        -- timeout closing the pipe and killing the group.
+        local slow = ctx:spawn({
+            argv = { "sh", "-c", "sleep 37.25 & exec sleep 37.25" },
+            timeout = 0.2,
+        }, function(result_ctx, result)
+            assert(result.timed_out)
+            assert(not result.success)
+            assert(result.signal == 9, tostring(result.signal))
+            record(result_ctx, "timeout")
+        end)
+        if slow == nil then
+            -- Staging never starts children.
+            return
+        end
+        limits_started = true
+        assert(ctx:spawn({
+            argv = { "i3sd-test-missing-command" },
+        }, function(result_ctx, result)
+            assert(result.exit_status == 127)
+            assert(not result.success and not result.timed_out)
+            record(result_ctx, "missing")
+        end))
+        local fillers = {}
+        for index = 1, 6 do
+            fillers[index] = assert(ctx:spawn({ argv = { "sleep", "30" } },
+                function()
+                    error("cancelled filler invoked its callback")
+                end))
+        end
+        assert(ctx:spawn({ argv = { "true" } }, function() end) == nil,
+            "a ninth child started")
+        for _, filler in ipairs(fillers) do
+            filler:cancel()
+        end
+        local ok, err = pcall(ctx.spawn, ctx, { argv = { "true" }, timeout = 0 },
+            function() end)
+        assert(not ok and err:find("positive number", 1, true), err)
+    end,
+}

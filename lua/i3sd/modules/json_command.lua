@@ -1,12 +1,13 @@
 local allowed = {
     command = true,
     interval = true,
+    timeout = true,
     format = true,
     order = true,
     key = true,
 }
 
-local STARTUP_RETRY_SECONDS = 0.1
+local RETRY_SECONDS = 0.1
 local MAX_NAME_BYTES = 256
 
 -- Each configuration generation loads a fresh module, so names reset on reload.
@@ -40,10 +41,15 @@ local function check_options(options)
         "json_command interval must be a positive number")
     assert(type(options.format) == "function",
         "json_command format must be a function")
+    assert(options.timeout == nil
+        or (type(options.timeout) == "number" and options.timeout > 0),
+        "json_command timeout must be a positive number")
 end
 
 local function command_error(result)
-    if result.overflow then
+    if result.timed_out then
+        return "timed out"
+    elseif result.overflow then
         return "output limit exceeded"
     elseif result.io_error then
         return "I/O error"
@@ -74,7 +80,13 @@ return function(options)
 
     local label = table.concat(options.command, "_"):gsub("[^%w]", "_"):lower()
         :gsub("_+", "_")
-    local startup_retry
+    -- A run that outlives its interval is killed instead of piling up.
+    local timeout = options.timeout or options.interval
+    -- The handle of the run in progress, so polls never overlap.
+    local running
+    -- A pending retry while no child slot is free, with its backoff delay.
+    local retry
+    local retry_delay = RETRY_SECONDS
 
     local function show_error(ctx, message)
         ctx:set {
@@ -85,6 +97,7 @@ return function(options)
     end
 
     local function complete(ctx, result)
+        running = nil
         if not result.success then
             show_error(ctx, command_error(result))
             return
@@ -99,14 +112,31 @@ return function(options)
         render(ctx, options.format(value))
     end
 
-    local function poll(ctx)
-        local handle = ctx:spawn({
-            argv = options.command,
-        }, complete)
+    local poll
 
-        if handle ~= nil and startup_retry ~= nil then
-            startup_retry:cancel()
-            startup_retry = nil
+    local function retry_poll(ctx)
+        retry = nil
+        poll(ctx)
+    end
+
+    function poll(ctx)
+        if running ~= nil then
+            return
+        end
+        running = ctx:spawn({
+            argv = options.command,
+            timeout = timeout,
+        }, complete)
+        if running ~= nil then
+            retry_delay = RETRY_SECONDS
+            return
+        end
+
+        -- Staging and busy child slots refuse to spawn; retry soon, but
+        -- back off so a lasting shortage never turns into busy polling.
+        if retry == nil then
+            retry = ctx:after(retry_delay, retry_poll)
+            retry_delay = math.min(retry_delay * 2, options.interval)
         end
     end
 
@@ -115,10 +145,6 @@ return function(options)
         key = options.key,
         order = options.order or 0,
         interval = options.interval,
-
-        init = function(ctx)
-            startup_retry = ctx:every(STARTUP_RETRY_SECONDS, poll)
-        end,
 
         update = poll,
     }

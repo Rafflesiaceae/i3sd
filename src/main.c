@@ -1400,10 +1400,7 @@ static int lua_context_watch_pipewire_volume(lua_State *lua) {
 static int lua_spawn_cancel(lua_State *lua) {
     struct lua_spawn_handle *handle =
         luaL_checkudata(lua, 1, spawn_handle_metatable);
-    if (handle->app->spawn.active &&
-        handle->app->spawn.serial == handle->serial) {
-        i3sd_spawn_cancel(handle->app);
-    }
+    i3sd_spawn_cancel_serial(handle->app, handle->serial);
     return 0;
 }
 
@@ -1412,7 +1409,8 @@ static int lua_context_spawn(lua_State *lua) {
     struct block *block = context->block;
     luaL_checktype(lua, 2, LUA_TTABLE);
     luaL_checktype(lua, 3, LUA_TFUNCTION);
-    static const char *const fields[] = {"argv", "stdin", "stdout_limit"};
+    static const char *const fields[] = {"argv", "stdin", "stdout_limit",
+                                         "timeout"};
     check_strict_table(lua, 2, fields, sizeof(fields) / sizeof(fields[0]));
 
     lua_getfield(lua, 2, "argv");
@@ -1499,9 +1497,18 @@ static int lua_context_spawn(lua_State *lua) {
         output_limit = (size_t)requested;
     }
 
+    /* A timeout kills the child's whole process group, so a hung command
+     * cannot keep its slot forever. */
+    lua_getfield(lua, 2, "timeout");
+    uint64_t timeout_ns = 0;
+    if (!lua_isnil(lua, -1) &&
+        (lua_type(lua, -1) != LUA_TNUMBER ||
+         !seconds_to_ns(lua, -1, false, &timeout_ns))) {
+        return luaL_error(lua, "spawn timeout must be a positive number");
+    }
+
     struct app *app = block->generation->app;
-    if (app->current != block->generation || block->faulted ||
-        app->spawn.active) {
+    if (app->current != block->generation || block->faulted) {
         lua_pushnil(lua);
         return 1;
     }
@@ -1522,8 +1529,15 @@ static int lua_context_spawn(lua_State *lua) {
     if (serial == 0) {
         serial = ++app->next_spawn_serial;
     }
-    const bool opened = i3sd_spawn_open(app, block, argv, input, input_len,
-                                        output_limit, callback_ref, serial);
+    uint64_t deadline_ns = 0;
+    if (timeout_ns != 0) {
+        const uint64_t now_ns = monotonic_now_ns();
+        deadline_ns =
+            timeout_ns > UINT64_MAX - now_ns ? UINT64_MAX : now_ns + timeout_ns;
+    }
+    const bool opened =
+        i3sd_spawn_open(app, block, argv, input, input_len, output_limit,
+                        deadline_ns, callback_ref, serial);
     free(argv);
     if (!opened) {
         luaL_unref(lua, LUA_REGISTRYINDEX, callback_ref);
@@ -2157,10 +2171,7 @@ static void generation_destroy(struct generation *generation) {
         return;
     }
     /* Spawn callbacks and child lifetime are owned by their Lua generation. */
-    if (generation->app->spawn.active &&
-        generation->app->spawn.block->generation == generation) {
-        i3sd_spawn_cancel(generation->app);
-    }
+    i3sd_spawn_cancel_owned(generation->app, generation, NULL);
     struct logical_timer *timer = generation->timers;
     while (timer != NULL) {
         if (timer->timer.active) {
@@ -2355,10 +2366,7 @@ void i3sd_fault_block(struct block *block) {
     }
     block->faulted = true;
     struct generation *generation = block->generation;
-    if (generation->app->spawn.active &&
-        generation->app->spawn.block == block) {
-        i3sd_spawn_cancel(generation->app);
-    }
+    i3sd_spawn_cancel_owned(generation->app, generation, block);
     for (struct logical_timer *timer = generation->timers; timer != NULL;
          timer = timer->next) {
         if (timer->block == block && !timer->cancelled) {
@@ -2815,15 +2823,9 @@ static void handle_signals(struct app *app) {
             case SIGCHLD: {
                 pid_t child;
                 int status;
-                do {
-                    child = waitpid(-1, &status, WNOHANG);
-                    if (app->spawn.active && child == app->spawn.pid) {
-                        app->spawn.pid = 0;
-                        app->spawn.wait_status = status;
-                        app->spawn.exited = true;
-                        i3sd_spawn_finish(app);
-                    }
-                } while (child > 0);
+                while ((child = waitpid(-1, &status, WNOHANG)) > 0) {
+                    i3sd_spawn_reaped(app, child, status);
+                }
                 break;
             }
             default:
@@ -2975,6 +2977,10 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     if (power_supply_deadline < deadline) {
         deadline = power_supply_deadline;
     }
+    const uint64_t spawn_deadline = i3sd_spawn_deadline(app);
+    if (spawn_deadline < deadline) {
+        deadline = spawn_deadline;
+    }
     if (app->reload_dirty) {
         return 0;
     }
@@ -3045,8 +3051,10 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
     if (app->dbus == NULL) {
         return false;
     }
-    app->spawn.output_fd = -1;
-    app->spawn.callback_ref = LUA_NOREF;
+    for (size_t index = 0; index < I3SD_MAX_SPAWNS; index++) {
+        app->spawns[index].output_fd = -1;
+        app->spawns[index].callback_ref = LUA_NOREF;
+    }
     return add_epoll_fd(app, app->signal_fd, EPOLLIN, SOURCE_SIGNAL) &&
            (!app->settings.click_events ||
             add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
@@ -3105,13 +3113,15 @@ static void run_event_loop(struct app *app) {
                 i3sd_power_supply_process(&app->power_supply,
                                           monotonic_now_ns());
                 break;
-            case SOURCE_SPAWN:
-                i3sd_spawn_read(app);
-                break;
             case SOURCE_PIPEWIRE:
                 i3sd_pipewire_process(app->pipewire, monotonic_now_ns());
                 break;
             default:
+                if (events[index].data.u64 >= SOURCE_SPAWN_FIRST &&
+                    events[index].data.u64 <= SOURCE_SPAWN_LAST) {
+                    i3sd_spawn_read(app, events[index].data.u64);
+                    break;
+                }
                 i3sd_dbus_process_cookie(app->dbus, app->current->dbus,
                                          events[index].data.u64,
                                          monotonic_now_ns());
@@ -3125,6 +3135,7 @@ static void run_event_loop(struct app *app) {
         i3sd_power_profiles_process(&app->power_profiles, now_ns);
         i3sd_pipewire_process(app->pipewire, now_ns);
         i3sd_dbus_process(app->dbus, app->current->dbus, now_ns);
+        i3sd_spawn_expire(app, now_ns);
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
             app->reload_dirty = false;
@@ -3179,10 +3190,7 @@ static void app_destroy(struct app *app) {
     i3sd_pipewire_destroy(app->pipewire);
     i3sd_nvidia_shutdown();
     i3sd_collectors_shutdown();
-    if (app->spawn.active) {
-        i3sd_spawn_cancel(app);
-    }
-    i3sd_buffer_destroy(&app->spawn.output);
+    i3sd_spawn_shutdown(app);
     i3sd_timer_heap_destroy(&app->timer_heap);
     i3sd_output_destroy(&app->output);
     i3sd_click_framer_destroy(&app->click_framer);

@@ -33,7 +33,7 @@ i3sd_pid=$!
 token=""
 attempt=0
 while test -z "$token" && test "$attempt" -lt 250; do
-    token="$(sed -n 's/.*"instance":"\([^"]*\)".*/\1/p' \
+    token="$(sed -n 's/.*"name":"menu","instance":"\([^"]*\)".*/\1/p' \
         "$test_dir/output" | tail -n 1)"
     attempt=$((attempt + 1))
     sleep 0.02
@@ -48,6 +48,27 @@ while ! grep -q '"full_text":"second"' "$test_dir/output" && \
     sleep 0.02
 done
 grep -q '"full_text":"second"' "$test_dir/output"
+
+# The timed-out child and its grandchild are gone, and the missing
+# executable reported exit status 127.
+attempt=0
+while ! grep -q '"full_text":"limits:missing,timeout"' "$test_dir/output" && \
+      test "$attempt" -lt 250; do
+    attempt=$((attempt + 1))
+    sleep 0.02
+done
+grep -q '"full_text":"limits:missing,timeout"' "$test_dir/output"
+# SIGKILL is asynchronous, so give the grandchild a moment to disappear.
+# The exact command-line match ignores unrelated processes mentioning it.
+attempt=0
+while pgrep -fx "sleep 37.25" >/dev/null && test "$attempt" -lt 100; do
+    attempt=$((attempt + 1))
+    sleep 0.02
+done
+if pgrep -fx "sleep 37.25" >/dev/null; then
+    echo "timed-out process group survived" >&2
+    exit 1
+fi
 test ! -s "$test_dir/error"
 kill -TERM "$i3sd_pid"
 wait "$i3sd_pid"

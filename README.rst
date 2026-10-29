@@ -78,9 +78,9 @@ Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for 
 polling. It displays one of ``▏ ▎ ▍ ▌ ▋ ▊ ▉ █`` for the volume, ``🔇`` while
 muted, and remains hidden while PipeWire or a default sink is unavailable.
 
-Lua modules can start one bounded asynchronous child process from a block
-callback. ``ctx:spawn`` returns ``nil`` during staging, when another child is
-active, or when process setup fails:
+Lua modules can start bounded asynchronous child processes from a block
+callback, up to eight at a time. ``ctx:spawn`` returns ``nil`` during staging,
+when all eight are running, or when process setup fails:
 
 .. code:: lua
 
@@ -88,13 +88,17 @@ active, or when process setup fails:
        argv = { "example-command", "--mode", "menu" },
        stdin = "first\nsecond\n",
        stdout_limit = 1024,
+       timeout = 10, -- seconds; omit it to let the child run indefinitely
    }, function(process_ctx, result)
        if result.success then
            process_ctx:set { full_text = result.stdout }
        end
    end)
 
-The returned handle has an idempotent ``cancel()`` method. The
+A child that outlives its ``timeout`` is killed together with any processes it
+started, and its result has ``timed_out = true``. ``json_command`` uses its
+``interval`` as the default ``timeout`` and never overlaps two runs of the same
+command. The returned handle has an idempotent ``cancel()`` method. The
 ``power_profiles`` module uses this primitive to implement its left-click rofi
 selector entirely in Lua. Install ``rofi`` when using that module.
 
