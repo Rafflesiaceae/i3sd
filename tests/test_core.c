@@ -1,4 +1,5 @@
 #include "i3sd/click.h"
+#include "i3sd/id_set.h"
 #include "i3sd/output.h"
 #include "i3sd/timer.h"
 #include "i3sd/utf8.h"
@@ -104,11 +105,42 @@ static void test_output(void) {
     i3sd_output_destroy(&output);
 }
 
+static void test_id_set(void) {
+    static struct i3sd_id_set set;
+    char keys[I3SD_ID_SET_CAPACITY][8];
+    size_t value = 0;
+
+    i3sd_id_set_init(&set);
+    assert(!i3sd_id_set_find(&set, "missing", 7, &value));
+
+    /* Filling every entry exercises probing with a fixed, bounded table. */
+    for (size_t index = 0; index < I3SD_ID_SET_CAPACITY; index++) {
+        snprintf(keys[index], sizeof(keys[index]), "id%zu", index);
+        assert(i3sd_id_set_insert(&set, keys[index], strlen(keys[index]),
+                                  index) == I3SD_ID_SET_INSERTED);
+    }
+    for (size_t index = 0; index < I3SD_ID_SET_CAPACITY; index++) {
+        assert(i3sd_id_set_find(&set, keys[index], strlen(keys[index]),
+                                &value));
+        assert(value == index);
+    }
+    assert(i3sd_id_set_insert(&set, "id7", 3, 0) == I3SD_ID_SET_DUPLICATE);
+    assert(i3sd_id_set_insert(&set, "extra", 5, 0) == I3SD_ID_SET_FULL);
+
+    /* Keys compare as byte strings, so prefixes and embedded bytes differ. */
+    assert(!i3sd_id_set_find(&set, "id", 2, &value));
+    assert(!i3sd_id_set_find(&set, "id1\0", 4, &value));
+
+    i3sd_id_set_init(&set);
+    assert(!i3sd_id_set_find(&set, "id0", 3, &value));
+}
+
 int main(void) {
     test_utf8();
     test_timers();
     test_click_framer();
     test_output();
+    test_id_set();
     puts("core tests passed");
     return 0;
 }

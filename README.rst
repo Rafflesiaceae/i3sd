@@ -98,6 +98,43 @@ The returned handle has an idempotent ``cancel()`` method. The
 ``power_profiles`` module uses this primitive to implement its left-click rofi
 selector entirely in Lua. Install ``rofi`` when using that module.
 
+Item lists
+----------
+
+A block can render a variable number of i3bar objects. Declare how many it may
+use with ``max_items`` and pass ``ctx:set`` a sequence of state tables instead
+of a single state:
+
+.. code:: lua
+
+   block {
+       name = "notifications",
+       max_items = 16,
+       update = function(ctx)
+           ctx:set {
+               { id = "vpn", full_text = "VPN up", color = "#00ff00" },
+               { id = "mail", full_text = "3 new" },
+           }
+       end,
+       click = function(ctx, button, event, id)
+           -- id is "vpn" or "mail" here, and nil for single-state blocks.
+       end,
+   }
+
+Each call replaces the complete list, which renders left to right in sequence
+order, and ``{}`` hides the block. Every entry accepts the same fields as a
+single ``ctx:set`` state plus an optional string ``id`` of at most 255 bytes.
+Ids must be unique within a list; they keep click routing stable while items
+come and go. Entries without an id are passed to ``click`` as their 1-based
+position. A click on an item that has disappeared since it was rendered is
+dropped.
+
+The core reconciles each list against the previous one: unchanged entries
+reuse their cached output without allocating, and only new or changed entries
+are validated and serialized. A failing call raises and leaves the rendered
+items untouched. All blocks of a configuration together reserve at most 256
+items; ``max_items`` defaults to 1.
+
 The ``battery`` module refreshes immediately on Linux power-supply change
 events and keeps a slower periodic sample as a resynchronization fallback.
 

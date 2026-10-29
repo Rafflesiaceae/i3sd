@@ -51,6 +51,7 @@ inc = include_directories('include', '.')
 core_sources = files(
     'src/buffer.c',
     'src/click.c',
+    'src/id_set.c',
     'src/output.c',
     'src/render_limiter.c',
     'src/timer.c',
@@ -61,7 +62,7 @@ core = static_library(
     'i3sd-core',
     core_sources,
     include_directories: inc,
-    dependencies: [yyjson],
+    dependencies: [yyjson, xxhash],
 )
 
 runtime_dependencies = [luajit, yyjson, xxhash, systemd, m]
@@ -94,7 +95,7 @@ test_core = executable(
     'tests/test_core.c',
     include_directories: inc,
     link_with: core,
-    dependencies: [yyjson],
+    dependencies: [yyjson, xxhash],
 )
 test('core', test_core)
 test(
@@ -134,6 +135,16 @@ test(
         meson.current_source_dir() / 'tests/config/rofi.lua',
         meson.current_source_dir() / 'tests/fake_rofi.sh',
     ],
+)
+test(
+    'item-lists',
+    find_program('tests/test_item_lists.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/item-lists.lua',
+        meson.current_source_dir() / 'tests/config/item-budget.lua',
+    ],
+    timeout: 15,
 )
 test(
     'config-recovery',

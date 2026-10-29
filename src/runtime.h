@@ -19,6 +19,10 @@
 #include <sys/types.h>
 
 #define I3SD_MAX_BLOCKS 256U
+/* Items rendered by all blocks of one generation. Keeping this equal to the
+ * block limit preserves the guarantee that a full frame fits its 2 MiB cap. */
+#define I3SD_MAX_FRAME_ITEMS 256U
+#define I3SD_MAX_ITEM_ID 255U
 #define I3SD_MAX_TIMERS 4096U
 #define I3SD_CONFIG_ERROR_MAX 6144U
 #define I3SD_POWER_PROFILE_LIMIT 16U
@@ -153,6 +157,14 @@ struct spawned_process {
     bool io_error;
 };
 
+/* One i3bar object rendered by a block, with its cached wire fragment. */
+struct block_item {
+    char *id; /* NULL for single-state and positional list items */
+    size_t id_len;
+    struct block_state state;
+    struct i3sd_buffer fragment;
+};
+
 struct block {
     struct generation *generation;
     char *name;
@@ -167,8 +179,12 @@ struct block {
     int click_ref;
     int context_ref;
     bool faulted;
-    struct block_state state;
-    struct i3sd_buffer fragment;
+    /* ctx:set reconciles into spare and swaps, so both hold max_items. */
+    size_t max_items;
+    size_t item_count;
+    struct block_item *items;
+    struct block_item *spare;
+    bool list_mode;
 };
 
 struct global_settings {
@@ -182,6 +198,7 @@ struct generation {
     struct block *blocks[I3SD_MAX_BLOCKS];
     struct block *ordered[I3SD_MAX_BLOCKS];
     size_t block_count;
+    size_t reserved_items;
     struct logical_timer *timers;
     struct systemd_subscription *systemd_subscriptions;
     struct power_profiles_subscription *power_profiles_subscriptions;

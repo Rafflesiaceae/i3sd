@@ -282,7 +282,17 @@ Block State
 -----------
 
 ``ctx:set { ... }`` replaces the block's complete rendered state. A newly constructed block has hidden/empty state until its
-first successful ``ctx:set``. During staging, ``ctx:set`` validates and stores candidate-local state only: it never requests process
+first successful ``ctx:set``.
+
+A block renders zero or more i3bar items. ``ctx:set`` receives either one state table or a dense sequence of state tables; the
+sequence form renders one item per entry, left to right, and ``{}`` is the empty list. A table mixing both forms is an error. The
+sequence length is bounded by the block's ``max_items`` (default ``1``, at most ``256``). ``max_items`` is a configuration-time
+reservation: the sum over all blocks of one generation must not exceed 256 items, so the frame bound below never depends on
+runtime list sizes. Sequence entries additionally accept an optional ``id``: a non-empty UTF-8 string of at most 255 bytes that is
+unique within the list. Identified items route clicks as ``<token>:<id>``, unidentified list items as ``<token>#<position>`` and
+single-state blocks keep the bare token. The core reconciles each list against the previous one by id, or by position for entries
+without one; unchanged entries keep their cached serialized output, and only new or changed entries are validated, copied and
+serialized. A failing ``ctx:set`` raises before replacing any item. During staging, ``ctx:set`` validates and stores candidate-local state only: it never requests process
 output/rendering, and ``RLD-003`` clears that staged state to hidden at pointer commit before live refresh/publication.
 
 Recognized i3bar fields are validated and copied immediately into a native C block-state structure.
@@ -391,7 +401,7 @@ Core/block callback signatures are:
 
    init(ctx)
    update(ctx)
-   click(ctx, button, event)
+   click(ctx, button, event, item)
    timer_fn(ctx)
    clock_change_fn(ctx)
    timezone_change_fn(ctx)
@@ -404,7 +414,9 @@ Core/block callback signatures are:
 ``button`` is the i3bar integer button value. The v1 click ``event`` table contains only recognized members that were present on the
 wire: integer ``x``, ``y``, ``relative_x``, ``relative_y``, ``output_x``, ``output_y``, ``width`` and ``height`` plus
 ``modifiers`` as an ordered 1-based sequence of strings. Wire ``name``/``instance`` are routing inputs and are not copied through as
-untrusted event fields; configured identity remains available from ``ctx``. Unknown click members are ignored.
+untrusted event fields; configured identity remains available from ``ctx``. ``item`` is ``nil`` for a single-state block and
+otherwise the clicked item's ``id`` or, without one, its 1-based position. A click on an item that no longer exists is dropped.
+Unknown click members are ignored.
 
 Primitive argument contracts are:
 
@@ -644,6 +656,8 @@ otherwise and are checked before allocation/growth where practical:
 - loaded Lua configuration dependencies: 256 files per generation;
 - referent-resolution symlink hops for a tracked path: 40;
 - configured blocks: 256;
+- rendered items reserved through ``max_items``: 256 per generation;
+- list item ``id``: 255 bytes;
 - ``name``/``key``: 256 bytes each;
 - each rendered text/string field: 6 KiB;
 - serialized contribution of one visible block object, including core-controlled wire fields: 7 KiB;
@@ -693,8 +707,8 @@ fit, reject the candidate **before** pointer commit; never discover steady-state
 
 During staging, exceeding a configuration/static limit, including the 16 MiB aggregate executed-source budget, rejects the candidate. During normal runtime, a block-owned request exceeding
 a limit raises an error in that block. ``ctx:set`` preflights only the resulting block object's exact serialized contribution; if it
-would exceed the 7 KiB per-visible-block bound, the operation fails before replacing canonical state. With at most 256 configured
-blocks, this contribution bound leaves sufficient headroom inside the 2 MiB frame cap for array framing, commas and fixed renderer
+would exceed the 7 KiB per-visible-item bound, the operation fails before replacing canonical state. With at most 256 reserved
+items, this contribution bound leaves sufficient headroom inside the 2 MiB frame cap for array framing, commas and fixed renderer
 overhead, so aggregate-frame overflow cannot depend on callback/update order. A source backlog uses the resnapshot rule above.
 Oversized click input is discarded without growing the core input buffer past its cap. A D-Bus message above the Lua-facing cap or a
 retained operation that would exceed the per-generation aggregate D-Bus payload budget is rejected before unbounded core-owned

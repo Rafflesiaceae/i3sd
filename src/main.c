@@ -5,6 +5,7 @@
 #include "dbus.h"
 #include "i3sd/buffer.h"
 #include "i3sd/click.h"
+#include "i3sd/id_set.h"
 #include "i3sd/output.h"
 #include "i3sd/timer.h"
 #include "i3sd/utf8.h"
@@ -58,6 +59,10 @@
 #define I3SD_SPAWN_OUTPUT_BYTES (64U * 1024U)
 #define I3SD_JSON_MAX_BYTES (1024U * 1024U)
 #define I3SD_JSON_MAX_DEPTH 64U
+/* Hex click token, separator, item id and NUL terminator of an instance. */
+#define I3SD_TOKEN_LEN 32U
+#define I3SD_INSTANCE_MAX (I3SD_TOKEN_LEN + 1U + I3SD_MAX_ITEM_ID + 1U)
+#define I3SD_ERROR_MAX 512U
 
 enum setting_override {
     SETTING_OVERRIDE_CLICK_EVENTS = 1U << 0,
@@ -189,12 +194,28 @@ static void block_state_destroy(struct block_state *state) {
     *state = (struct block_state){0};
 }
 
+static void block_item_destroy(struct block_item *item) {
+    block_state_destroy(&item->state);
+    i3sd_buffer_destroy(&item->fragment);
+    free(item->id);
+    *item = (struct block_item){0};
+}
+
+/* Hide a block by dropping every rendered item; the arrays stay allocated. */
+static void block_items_clear(struct block *block) {
+    for (size_t index = 0; index < block->item_count; index++) {
+        block_item_destroy(&block->items[index]);
+    }
+    block->item_count = 0;
+}
+
 static void block_destroy(struct block *block) {
     if (block == NULL) {
         return;
     }
-    block_state_destroy(&block->state);
-    i3sd_buffer_destroy(&block->fragment);
+    block_items_clear(block);
+    free(block->items);
+    free(block->spare);
     free(block->name);
     free(block->key);
     free(block);
@@ -316,54 +337,6 @@ static int lua_configure(lua_State *lua) {
     return 0;
 }
 
-static char *optional_text_field(lua_State *lua, int table, const char *field,
-                                 size_t limit) {
-    lua_getfield(lua, table, field);
-    if (lua_isnil(lua, -1)) {
-        lua_pop(lua, 1);
-        return NULL;
-    }
-    size_t len;
-    const char *value = luaL_checklstring(lua, -1, &len);
-    if (!valid_text(value, len, limit)) {
-        luaL_error(lua, "%s must be valid, NUL-free UTF-8 of at most %zu bytes",
-                   field, limit);
-    }
-    char *copy = copy_bytes(value, len);
-    lua_pop(lua, 1);
-    if (copy == NULL) {
-        luaL_error(lua, "out of memory copying %s", field);
-    }
-    return copy;
-}
-
-static bool optional_boolean_field(lua_State *lua, int table,
-                                   const char *field) {
-    lua_getfield(lua, table, field);
-    if (lua_isnil(lua, -1)) {
-        lua_pop(lua, 1);
-        return false;
-    }
-    luaL_checktype(lua, -1, LUA_TBOOLEAN);
-    bool result = lua_toboolean(lua, -1);
-    lua_pop(lua, 1);
-    return result;
-}
-
-static int optional_border_field(lua_State *lua, int table, const char *field) {
-    lua_getfield(lua, table, field);
-    if (lua_isnil(lua, -1)) {
-        lua_pop(lua, 1);
-        return 0;
-    }
-    const lua_Integer value = luaL_checkinteger(lua, -1);
-    lua_pop(lua, 1);
-    if (value < 0 || value > INT_MAX) {
-        luaL_error(lua, "%s must be a non-negative integer", field);
-    }
-    return (int)value;
-}
-
 static bool valid_color(const char *color) {
     if (color == NULL) {
         return true;
@@ -389,7 +362,8 @@ static bool enum_value(const char *value, const char *first, const char *second,
            (third != NULL && strcmp(value, third) == 0);
 }
 
-static bool serialize_block(struct block *block, struct block_state *state,
+static bool serialize_block(const char *name, const char *instance,
+                            const struct block_state *state,
                             struct i3sd_buffer *fragment) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     if (document == NULL) {
@@ -441,8 +415,8 @@ static bool serialize_block(struct block *block, struct block_state *state,
         yyjson_mut_obj_add_bool(document, object, "urgent", true);
     }
     ADD_STRING("markup", state->markup);
-    ADD_STRING("name", block->name);
-    ADD_STRING("instance", block->token);
+    ADD_STRING("name", name);
+    ADD_STRING("instance", instance);
     yyjson_mut_obj_add_bool(document, object, "separator", false);
     yyjson_mut_obj_add_int(document, object, "separator_block_width", 9);
 #undef ADD_STRING
@@ -461,111 +435,561 @@ static bool serialize_block(struct block *block, struct block_state *state,
     return success;
 }
 
-static bool state_equal(const struct block_state *left,
-                        const struct block_state *right) {
-#define STRING_EQUAL(field)                                                    \
-    (((left)->field == NULL && (right)->field == NULL) ||                      \
-     ((left)->field != NULL && (right)->field != NULL &&                       \
-      strcmp((left)->field, (right)->field) == 0))
-    return STRING_EQUAL(full_text) && STRING_EQUAL(short_text) &&
-           STRING_EQUAL(color) && STRING_EQUAL(background) &&
-           STRING_EQUAL(border) && STRING_EQUAL(min_width_string) &&
-           STRING_EQUAL(align) && STRING_EQUAL(markup) &&
-           left->min_width_integer == right->min_width_integer &&
-           left->border_top == right->border_top &&
-           left->border_right == right->border_right &&
-           left->border_bottom == right->border_bottom &&
-           left->border_left == right->border_left &&
-           left->min_width_is_string == right->min_width_is_string &&
-           left->min_width_present == right->min_width_present &&
-           left->urgent == right->urgent && left->visible == right->visible;
-#undef STRING_EQUAL
+enum text_field {
+    TEXT_FULL,
+    TEXT_SHORT,
+    TEXT_COLOR,
+    TEXT_BACKGROUND,
+    TEXT_BORDER,
+    TEXT_ALIGN,
+    TEXT_MARKUP,
+    TEXT_FIELD_COUNT,
+};
+
+static const struct {
+    const char *name;
+    size_t limit;
+    size_t offset;
+} text_fields[TEXT_FIELD_COUNT] = {
+    [TEXT_FULL] = {"full_text", I3SD_MAX_TEXT,
+                   offsetof(struct block_state, full_text)},
+    [TEXT_SHORT] = {"short_text", I3SD_MAX_TEXT,
+                    offsetof(struct block_state, short_text)},
+    [TEXT_COLOR] = {"color", 9, offsetof(struct block_state, color)},
+    [TEXT_BACKGROUND] = {"background", 9,
+                         offsetof(struct block_state, background)},
+    [TEXT_BORDER] = {"border", 9, offsetof(struct block_state, border)},
+    [TEXT_ALIGN] = {"align", 8, offsetof(struct block_state, align)},
+    [TEXT_MARKUP] = {"markup", 8, offsetof(struct block_state, markup)},
+};
+
+static const char *const border_fields[] = {
+    "border_top",
+    "border_right",
+    "border_bottom",
+    "border_left",
+};
+
+/* A text value borrowed from the state table. Lua strings stay alive while the
+ * table is on the stack for the whole ctx:set call, but numbers converted to
+ * text have no Lua owner and are therefore copied into number. */
+struct text_view {
+    const char *data;
+    size_t len;
+    bool present;
+    char number[64];
+};
+
+/* Unvalidated, allocation-free view of one state table. Values are validated
+ * only when they differ from the current state, because stored state already
+ * passed validation. */
+struct state_view {
+    struct text_view text[TEXT_FIELD_COUNT];
+    struct text_view min_width_text;
+    struct text_view id;
+    lua_Integer border[4];
+    lua_Integer min_width_integer;
+    bool min_width_present;
+    bool min_width_is_string;
+    bool urgent;
+};
+
+static char **state_text(struct block_state *state, enum text_field field) {
+    return (char **)((char *)state + text_fields[field].offset);
 }
 
+static const char *state_text_const(const struct block_state *state,
+                                    enum text_field field) {
+    return *(char *const *)((const char *)state + text_fields[field].offset);
+}
+
+static int *state_border(struct block_state *state, size_t index) {
+    int *const borders[] = {&state->border_top, &state->border_right,
+                            &state->border_bottom, &state->border_left};
+    return borders[index];
+}
+
+static int state_border_const(const struct block_state *state, size_t index) {
+    const int borders[] = {state->border_top, state->border_right,
+                           state->border_bottom, state->border_left};
+    return borders[index];
+}
+
+static bool read_text_view(lua_State *lua, struct text_view *view,
+                           const char *field, char *error, size_t error_size) {
+    if (lua_type(lua, -1) == LUA_TSTRING) {
+        view->data = lua_tolstring(lua, -1, &view->len);
+    } else if (lua_type(lua, -1) == LUA_TNUMBER) {
+        /* Converting the stack copy leaves the caller's table untouched. */
+        size_t len;
+        const char *text = lua_tolstring(lua, -1, &len);
+        if (len >= sizeof(view->number)) {
+            snprintf(error, error_size, "%s number is too long", field);
+            return false;
+        }
+        memcpy(view->number, text, len);
+        view->data = view->number;
+        view->len = len;
+    } else {
+        snprintf(error, error_size, "%s must be a string", field);
+        return false;
+    }
+    view->present = true;
+    return true;
+}
+
+static bool read_integer_view(lua_State *lua, lua_Integer *value,
+                              const char *field, char *error,
+                              size_t error_size) {
+    if (!lua_isnumber(lua, -1)) {
+        snprintf(error, error_size, "%s must be a non-negative integer",
+                 field);
+        return false;
+    }
+    *value = lua_tointeger(lua, -1);
+    return true;
+}
+
+/* Store the value at the top of the stack into its view field. */
+static bool read_state_field(lua_State *lua, const char *key, bool allow_id,
+                             struct state_view *view, char *error,
+                             size_t error_size) {
+    for (size_t field = 0; field < TEXT_FIELD_COUNT; field++) {
+        if (strcmp(key, text_fields[field].name) == 0) {
+            return read_text_view(lua, &view->text[field], key, error,
+                                  error_size);
+        }
+    }
+    for (size_t index = 0; index < 4; index++) {
+        if (strcmp(key, border_fields[index]) == 0) {
+            return read_integer_view(lua, &view->border[index], key, error,
+                                     error_size);
+        }
+    }
+    if (strcmp(key, "min_width") == 0) {
+        view->min_width_present = true;
+        if (lua_type(lua, -1) == LUA_TSTRING) {
+            view->min_width_is_string = true;
+            return read_text_view(lua, &view->min_width_text, key, error,
+                                  error_size);
+        }
+        return read_integer_view(lua, &view->min_width_integer, key, error,
+                                 error_size);
+    }
+    if (strcmp(key, "urgent") == 0) {
+        if (lua_type(lua, -1) != LUA_TBOOLEAN) {
+            snprintf(error, error_size, "urgent must be a boolean");
+            return false;
+        }
+        view->urgent = lua_toboolean(lua, -1);
+        return true;
+    }
+    if (allow_id && strcmp(key, "id") == 0) {
+        /* Ids are compared across items after the view is gone, so only real
+         * Lua strings, whose storage outlives this field, are accepted. */
+        if (lua_type(lua, -1) != LUA_TSTRING) {
+            snprintf(error, error_size, "id must be a string");
+            return false;
+        }
+        view->id.data = lua_tolstring(lua, -1, &view->id.len);
+        view->id.present = true;
+        return true;
+    }
+    snprintf(error, error_size, "unknown option '%s'", key);
+    return false;
+}
+
+/* Read one state table in a single raw traversal without allocating. Errors
+ * are returned rather than raised because earlier items of the same call may
+ * already own allocations that must be released first. */
+static bool parse_state_view(lua_State *lua, int table, bool allow_id,
+                             struct state_view *view, char *error,
+                             size_t error_size) {
+    *view = (struct state_view){0};
+    lua_pushnil(lua);
+    while (lua_next(lua, table) != 0) {
+        if (lua_type(lua, -2) != LUA_TSTRING) {
+            lua_pop(lua, 2);
+            snprintf(error, error_size, "unknown option '<non-string>'");
+            return false;
+        }
+        const bool read = read_state_field(lua, lua_tostring(lua, -2),
+                                           allow_id, view, error, error_size);
+        lua_pop(lua, 1);
+        if (!read) {
+            lua_pop(lua, 1);
+            return false;
+        }
+    }
+    if (!view->text[TEXT_FULL].present) {
+        snprintf(error, error_size, "full_text is required");
+        return false;
+    }
+    return true;
+}
+
+static bool text_matches(const char *stored, const struct text_view *view) {
+    if (!view->present) {
+        return stored == NULL;
+    }
+    return stored != NULL && strlen(stored) == view->len &&
+           memcmp(stored, view->data, view->len) == 0;
+}
+
+static bool state_matches_view(const struct block_state *state,
+                               const struct state_view *view) {
+    for (size_t field = 0; field < TEXT_FIELD_COUNT; field++) {
+        if (!text_matches(state_text_const(state, field), &view->text[field])) {
+            return false;
+        }
+    }
+    for (size_t index = 0; index < 4; index++) {
+        if (state_border_const(state, index) != view->border[index]) {
+            return false;
+        }
+    }
+    if (state->min_width_present != view->min_width_present ||
+        state->min_width_is_string != view->min_width_is_string ||
+        state->urgent != view->urgent) {
+        return false;
+    }
+    return view->min_width_is_string
+               ? text_matches(state->min_width_string, &view->min_width_text)
+               : state->min_width_integer == view->min_width_integer;
+}
+
+/* Validate a view and copy it into owned state. */
+static bool materialize_state(const struct state_view *view,
+                              struct block_state *state, char *error,
+                              size_t error_size) {
+    *state = (struct block_state){0};
+    for (size_t field = 0; field < TEXT_FIELD_COUNT; field++) {
+        const struct text_view *text = &view->text[field];
+        if (text->present &&
+            !valid_text(text->data, text->len, text_fields[field].limit)) {
+            snprintf(error, error_size,
+                     "%s must be valid, NUL-free UTF-8 of at most %zu bytes",
+                     text_fields[field].name, text_fields[field].limit);
+            return false;
+        }
+    }
+    for (size_t index = 0; index < 4; index++) {
+        if (view->border[index] < 0 || view->border[index] > INT_MAX) {
+            snprintf(error, error_size, "%s must be a non-negative integer",
+                     border_fields[index]);
+            return false;
+        }
+    }
+    if (view->min_width_is_string &&
+        !valid_text(view->min_width_text.data, view->min_width_text.len,
+                    I3SD_MAX_TEXT)) {
+        snprintf(error, error_size, "min_width string is invalid");
+        return false;
+    }
+    if (!view->min_width_is_string && view->min_width_integer < 0) {
+        snprintf(error, error_size, "min_width must be non-negative");
+        return false;
+    }
+
+    for (size_t field = 0; field < TEXT_FIELD_COUNT; field++) {
+        const struct text_view *text = &view->text[field];
+        if (text->present &&
+            (*state_text(state, field) = copy_bytes(text->data, text->len)) ==
+                NULL) {
+            goto out_of_memory;
+        }
+    }
+    if (view->min_width_is_string &&
+        (state->min_width_string = copy_bytes(view->min_width_text.data,
+                                              view->min_width_text.len)) ==
+            NULL) {
+        goto out_of_memory;
+    }
+    for (size_t index = 0; index < 4; index++) {
+        *state_border(state, index) = (int)view->border[index];
+    }
+    state->min_width_integer = view->min_width_integer;
+    state->min_width_present = view->min_width_present;
+    state->min_width_is_string = view->min_width_is_string;
+    state->urgent = view->urgent;
+    state->visible = state->full_text[0] != '\0';
+
+    if (!valid_color(state->color) || !valid_color(state->background) ||
+        !valid_color(state->border)) {
+        block_state_destroy(state);
+        snprintf(error, error_size,
+                 "color fields must use #RRGGBB or #RRGGBBAA");
+        return false;
+    }
+    if (!enum_value(state->align, "left", "center", "right") ||
+        !enum_value(state->markup, "none", "pango", NULL)) {
+        block_state_destroy(state);
+        snprintf(error, error_size, "invalid align or markup value");
+        return false;
+    }
+    return true;
+
+out_of_memory:
+    block_state_destroy(state);
+    snprintf(error, error_size, "out of memory copying block state");
+    return false;
+}
+
+/* Wire instances route clicks back to an item: the bare token for a single
+ * state, token:id for identified items and token#position otherwise. */
+static void format_instance(const struct block *block, bool list_mode,
+                            const char *id, size_t id_len, size_t position,
+                            char instance[static I3SD_INSTANCE_MAX]) {
+    if (!list_mode) {
+        snprintf(instance, I3SD_INSTANCE_MAX, "%s", block->token);
+    } else if (id != NULL) {
+        snprintf(instance, I3SD_INSTANCE_MAX, "%s:%.*s", block->token,
+                 (int)id_len, id);
+    } else {
+        snprintf(instance, I3SD_INSTANCE_MAX, "%s#%zu", block->token,
+                 position + 1);
+    }
+}
+
+static bool materialize_item(const struct block *block, bool list_mode,
+                             size_t position, const struct state_view *view,
+                             struct block_item *item, char *error,
+                             size_t error_size) {
+    if (view->id.present &&
+        (view->id.len == 0 ||
+         !valid_text(view->id.data, view->id.len, I3SD_MAX_ITEM_ID))) {
+        snprintf(error, error_size,
+                 "id must be non-empty, NUL-free UTF-8 of at most %u bytes",
+                 I3SD_MAX_ITEM_ID);
+        return false;
+    }
+    if (!materialize_state(view, &item->state, error, error_size)) {
+        return false;
+    }
+    if (view->id.present) {
+        item->id = copy_bytes(view->id.data, view->id.len);
+        item->id_len = view->id.len;
+        if (item->id == NULL) {
+            block_item_destroy(item);
+            snprintf(error, error_size, "out of memory copying item id");
+            return false;
+        }
+    }
+    if (item->state.visible) {
+        char instance[I3SD_INSTANCE_MAX];
+        format_instance(block, list_mode, item->id, item->id_len, position,
+                        instance);
+        if (!serialize_block(block->name, instance, &item->state,
+                             &item->fragment)) {
+            block_item_destroy(item);
+            snprintf(error, error_size,
+                     "rendered block exceeds the 7 KiB limit");
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Determine whether ctx:set received one state or a sequence of states and
+ * return the number of items. Nothing is allocated yet, so errors raise. */
+static size_t classify_set_argument(lua_State *lua, const struct block *block,
+                                    bool *list_mode) {
+    lua_rawgeti(lua, 2, 1);
+    *list_mode = !lua_isnil(lua, -1);
+    lua_pop(lua, 1);
+    if (!*list_mode) {
+        lua_pushnil(lua);
+        if (lua_next(lua, 2) != 0) {
+            lua_pop(lua, 2);
+            return 1;
+        }
+        /* An empty table is the empty list and hides every item. */
+        *list_mode = true;
+        return 0;
+    }
+
+    const size_t count = lua_objlen(lua, 2);
+    size_t keys = 0;
+    lua_pushnil(lua);
+    while (lua_next(lua, 2) != 0) {
+        lua_pop(lua, 1);
+        const lua_Number key = lua_type(lua, -1) == LUA_TNUMBER
+                                   ? lua_tonumber(lua, -1)
+                                   : 0;
+        /* Distinct integer keys within 1..count, count of them, are exactly
+         * the sequence 1..count. */
+        if (key < 1 || key > (lua_Number)count || key != floor(key)) {
+            luaL_error(lua, "item lists must be sequences of state tables");
+        }
+        keys++;
+    }
+    if (keys != count) {
+        luaL_error(lua, "item lists must be sequences of state tables");
+    }
+    if (count > block->max_items) {
+        /* LuaJIT's luaL_error formats only %d among the integer forms. */
+        luaL_error(lua, "block %s renders at most %d items", block->name,
+                   (int)block->max_items);
+    }
+    return count;
+}
+
+static const char *item_id(const struct block_item *old,
+                           const struct block_item *next, const size_t *reuse,
+                           size_t index, size_t *len) {
+    const struct block_item *item =
+        reuse[index] != SIZE_MAX ? &old[reuse[index]] : &next[index];
+    *len = item->id_len;
+    return item->id;
+}
+
+/* ctx:set accepts one state table or a sequence of them and reconciles the
+ * result against the current items. Unchanged items keep their cached
+ * fragments without any allocation; only new or changed items are validated,
+ * copied and serialized. The update is all-or-nothing. */
 static int lua_context_set(lua_State *lua) {
     struct lua_context *context = check_context(lua, 1);
     struct block *block = context->block;
     luaL_checktype(lua, 2, LUA_TTABLE);
-    static const char *const fields[] = {
-        "full_text",   "short_text", "color",        "background",
-        "border",      "border_top", "border_right", "border_bottom",
-        "border_left", "min_width",  "align",        "urgent",
-        "markup",
-    };
-    check_strict_table(lua, 2, fields, sizeof(fields) / sizeof(fields[0]));
 
-    struct block_state candidate = {0};
-    candidate.full_text =
-        optional_text_field(lua, 2, "full_text", I3SD_MAX_TEXT);
-    if (candidate.full_text == NULL) {
-        return luaL_error(lua, "full_text is required");
+    bool list_mode;
+    const size_t count = classify_set_argument(lua, block, &list_mode);
+    if (block->items == NULL) {
+        block->items = calloc(block->max_items, sizeof(*block->items));
+        block->spare = calloc(block->max_items, sizeof(*block->spare));
+        if (block->items == NULL || block->spare == NULL) {
+            free(block->items);
+            free(block->spare);
+            block->items = block->spare = NULL;
+            return luaL_error(lua, "out of memory allocating block items");
+        }
     }
-    candidate.short_text =
-        optional_text_field(lua, 2, "short_text", I3SD_MAX_TEXT);
-    candidate.color = optional_text_field(lua, 2, "color", 9);
-    candidate.background = optional_text_field(lua, 2, "background", 9);
-    candidate.border = optional_text_field(lua, 2, "border", 9);
-    candidate.align = optional_text_field(lua, 2, "align", 8);
-    candidate.markup = optional_text_field(lua, 2, "markup", 8);
-    candidate.border_top = optional_border_field(lua, 2, "border_top");
-    candidate.border_right = optional_border_field(lua, 2, "border_right");
-    candidate.border_bottom = optional_border_field(lua, 2, "border_bottom");
-    candidate.border_left = optional_border_field(lua, 2, "border_left");
-    candidate.urgent = optional_boolean_field(lua, 2, "urgent");
-    candidate.visible = candidate.full_text[0] != '\0';
 
-    lua_getfield(lua, 2, "min_width");
-    if (!lua_isnil(lua, -1)) {
-        candidate.min_width_present = true;
-        if (lua_type(lua, -1) == LUA_TSTRING) {
-            size_t len;
-            const char *value = lua_tolstring(lua, -1, &len);
-            if (!valid_text(value, len, I3SD_MAX_TEXT)) {
-                luaL_error(lua, "min_width string is invalid");
+    struct block_item *old = block->items;
+    struct block_item *next = block->spare;
+    const size_t old_count = block->item_count;
+    /* Switching between single and list form changes every wire instance,
+     * so no cached fragment can be reused across that switch. */
+    const bool reusable = list_mode == block->list_mode;
+    /* Steady-state lists repeat their ids in place and are matched by a
+     * cheap positional comparison. The hash indexes are built only once an
+     * id appears out of place. */
+    struct i3sd_id_set old_ids;
+    struct i3sd_id_set new_ids;
+    bool indexed = false;
+    size_t reuse[I3SD_MAX_FRAME_ITEMS];
+    bool changed = count != old_count;
+    char detail[I3SD_ERROR_MAX];
+    char error[I3SD_ERROR_MAX + 32];
+    size_t done = 0;
+    struct state_view view;
+
+    for (size_t index = 0; index < count; index++) {
+        int table = 2;
+        if (list_mode) {
+            lua_rawgeti(lua, 2, (int)index + 1);
+            table = lua_gettop(lua);
+            if (!lua_istable(lua, table)) {
+                snprintf(detail, sizeof(detail), "must be a state table");
+                goto fail;
             }
-            candidate.min_width_string = copy_bytes(value, len);
-            candidate.min_width_is_string = true;
+        }
+        if (!parse_state_view(lua, table, list_mode, &view, detail,
+                              sizeof(detail))) {
+            goto fail;
+        }
+
+        size_t match = SIZE_MAX;
+        if (view.id.present) {
+            if (reusable && !indexed && index < old_count &&
+                old[index].id != NULL && old[index].id_len == view.id.len &&
+                memcmp(old[index].id, view.id.data, view.id.len) == 0) {
+                /* Old ids are unique, so positional matches are too. */
+                match = index;
+            } else {
+                if (!indexed) {
+                    i3sd_id_set_init(&new_ids);
+                    for (size_t prior = 0; prior < index; prior++) {
+                        size_t len;
+                        const char *id = item_id(old, next, reuse, prior, &len);
+                        if (id != NULL) {
+                            i3sd_id_set_insert(&new_ids, id, len, prior);
+                        }
+                    }
+                    i3sd_id_set_init(&old_ids);
+                    for (size_t prior = 0; reusable && prior < old_count;
+                         prior++) {
+                        if (old[prior].id != NULL) {
+                            i3sd_id_set_insert(&old_ids, old[prior].id,
+                                               old[prior].id_len, prior);
+                        }
+                    }
+                    indexed = true;
+                }
+                if (i3sd_id_set_insert(&new_ids, view.id.data, view.id.len,
+                                       index) != I3SD_ID_SET_INSERTED) {
+                    snprintf(detail, sizeof(detail), "duplicate id '%.*s'",
+                             (int)view.id.len, view.id.data);
+                    goto fail;
+                }
+                if (!i3sd_id_set_find(&old_ids, view.id.data, view.id.len,
+                                      &match)) {
+                    match = SIZE_MAX;
+                }
+            }
+        } else if (reusable && index < old_count && old[index].id == NULL) {
+            match = index;
+        }
+
+        if (match != SIZE_MAX && state_matches_view(&old[match].state, &view)) {
+            reuse[index] = match;
+            changed = changed || match != index;
         } else {
-            const lua_Integer value = luaL_checkinteger(lua, -1);
-            if (value < 0) {
-                luaL_error(lua, "min_width must be non-negative");
+            reuse[index] = SIZE_MAX;
+            if (!materialize_item(block, list_mode, index, &view, &next[index],
+                                  detail, sizeof(detail))) {
+                goto fail;
             }
-            candidate.min_width_integer = value;
+            changed = true;
+        }
+        done = index + 1;
+        if (list_mode) {
+            lua_pop(lua, 1);
         }
     }
-    lua_pop(lua, 1);
 
-    if (!valid_color(candidate.color) || !valid_color(candidate.background) ||
-        !valid_color(candidate.border)) {
-        block_state_destroy(&candidate);
-        return luaL_error(lua, "color fields must use #RRGGBB or #RRGGBBAA");
-    }
-    if (!enum_value(candidate.align, "left", "center", "right") ||
-        !enum_value(candidate.markup, "none", "pango", NULL)) {
-        block_state_destroy(&candidate);
-        return luaL_error(lua, "invalid align or markup value");
-    }
-
-    struct i3sd_buffer fragment = {0};
-    if (candidate.visible && !serialize_block(block, &candidate, &fragment)) {
-        block_state_destroy(&candidate);
-        return luaL_error(lua, "rendered block exceeds the 7 KiB limit");
-    }
-    const bool changed = !state_equal(&block->state, &candidate);
-    if (changed) {
-        block_state_destroy(&block->state);
-        i3sd_buffer_destroy(&block->fragment);
-        block->state = candidate;
-        block->fragment = fragment;
-        if (!block->generation->staging &&
-            block->generation->app->current == block->generation) {
-            block->generation->app->render_dirty = true;
+    /* Move reused items into place; whatever remains in old is retired. */
+    for (size_t index = 0; index < count; index++) {
+        if (reuse[index] != SIZE_MAX) {
+            next[index] = old[reuse[index]];
+            old[reuse[index]] = (struct block_item){0};
         }
-    } else {
-        block_state_destroy(&candidate);
-        i3sd_buffer_destroy(&fragment);
+    }
+    for (size_t index = 0; index < old_count; index++) {
+        block_item_destroy(&old[index]);
+    }
+    block->items = next;
+    block->spare = old;
+    block->item_count = count;
+    block->list_mode = list_mode;
+    if (changed && !block->generation->staging &&
+        block->generation->app->current == block->generation) {
+        block->generation->app->render_dirty = true;
     }
     return 0;
+
+fail:
+    for (size_t index = 0; index < done; index++) {
+        if (reuse[index] == SIZE_MAX) {
+            block_item_destroy(&next[index]);
+        }
+    }
+    if (list_mode) {
+        snprintf(error, sizeof(error), "item %zu: %s", done + 1, detail);
+    } else {
+        snprintf(error, sizeof(error), "%s", detail);
+    }
+    return luaL_error(lua, "%s", error);
 }
 
 static int lua_timer_cancel(lua_State *lua) {
@@ -1127,11 +1551,31 @@ static int reference_function(lua_State *lua, int table, const char *field) {
 static int lua_define_block(lua_State *lua) {
     struct generation *generation = lua_touserdata(lua, lua_upvalueindex(1));
     luaL_checktype(lua, 1, LUA_TTABLE);
-    static const char *const fields[] = {"name", "key",    "order", "interval",
-                                         "init", "update", "click"};
+    static const char *const fields[] = {
+        "name",      "key",  "order",  "interval",
+        "max_items", "init", "update", "click",
+    };
     check_strict_table(lua, 1, fields, sizeof(fields) / sizeof(fields[0]));
     if (generation->block_count == I3SD_MAX_BLOCKS) {
         return luaL_error(lua, "block limit reached");
+    }
+
+    /* Item capacity is reserved at configuration time, so the frame size
+     * bound never depends on what blocks render at runtime. */
+    size_t max_items = 1;
+    lua_getfield(lua, 1, "max_items");
+    if (!lua_isnil(lua, -1)) {
+        const lua_Integer value = luaL_checkinteger(lua, -1);
+        if (value < 1 || value > (lua_Integer)I3SD_MAX_FRAME_ITEMS) {
+            return luaL_error(lua, "max_items must be between 1 and %d",
+                              (int)I3SD_MAX_FRAME_ITEMS);
+        }
+        max_items = (size_t)value;
+    }
+    lua_pop(lua, 1);
+    if (max_items > I3SD_MAX_FRAME_ITEMS - generation->reserved_items) {
+        return luaL_error(lua, "blocks reserve more than %d items in total",
+                          (int)I3SD_MAX_FRAME_ITEMS);
     }
 
     lua_getfield(lua, 1, "name");
@@ -1147,6 +1591,7 @@ static int lua_define_block(lua_State *lua) {
     block->generation = generation;
     block->name = copy_bytes(name, name_len);
     block->declaration_order = generation->block_count;
+    block->max_items = max_items;
     block->init_ref = block->update_ref = block->click_ref = LUA_NOREF;
     lua_pop(lua, 1);
 
@@ -1204,6 +1649,7 @@ static int lua_define_block(lua_State *lua) {
     lua_setmetatable(lua, -2);
     block->context_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
     generation->blocks[generation->block_count++] = block;
+    generation->reserved_items += max_items;
     return 0;
 }
 
@@ -1728,8 +2174,7 @@ void i3sd_fault_block(struct block *block) {
     }
     i3sd_dbus_cancel_owner(generation->dbus, block);
     i3sd_pipewire_cancel_owner(generation->app->pipewire, block);
-    block_state_destroy(&block->state);
-    i3sd_buffer_clear(&block->fragment);
+    block_items_clear(block);
     generation->app->render_dirty = true;
 }
 
@@ -1772,9 +2217,7 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
               app->settings.debug ? "true" : "false");
 
     for (size_t index = 0; index < candidate->block_count; index++) {
-        struct block *block = candidate->blocks[index];
-        block_state_destroy(&block->state);
-        i3sd_buffer_clear(&block->fragment);
+        block_items_clear(candidate->blocks[index]);
     }
     for (struct logical_timer *timer = candidate->timers; timer != NULL;
          timer = timer->next) {
@@ -1842,20 +2285,27 @@ static bool render_status(struct app *app) {
     } else {
         bool first = true;
         for (size_t index = 0; index < app->current->block_count; index++) {
-            struct block *block = app->current->ordered[index];
-            if (block->faulted || !block->state.visible) {
+            const struct block *block = app->current->ordered[index];
+            if (block->faulted) {
                 continue;
             }
-            if (!first && !i3sd_buffer_append_char(&app->frame, ',',
-                                                   I3SD_FRAME_MAX_BYTES)) {
-                return false;
+            /* Items are already serialized, so a frame is only copying. */
+            for (size_t item = 0; item < block->item_count; item++) {
+                const struct block_item *rendered = &block->items[item];
+                if (!rendered->state.visible) {
+                    continue;
+                }
+                if (!first && !i3sd_buffer_append_char(&app->frame, ',',
+                                                       I3SD_FRAME_MAX_BYTES)) {
+                    return false;
+                }
+                if (!i3sd_buffer_append(&app->frame, rendered->fragment.data,
+                                        rendered->fragment.len,
+                                        I3SD_FRAME_MAX_BYTES)) {
+                    return false;
+                }
+                first = false;
             }
-            if (!i3sd_buffer_append(&app->frame, block->fragment.data,
-                                    block->fragment.len,
-                                    I3SD_FRAME_MAX_BYTES)) {
-                return false;
-            }
-            first = false;
         }
     }
     if (!i3sd_buffer_append_char(&app->frame, ']', I3SD_FRAME_MAX_BYTES)) {
@@ -1933,6 +2383,54 @@ static bool flush_output(struct app *app) {
     return epoll_stdout(app, i3sd_output_has_pending(&app->output));
 }
 
+/* Resolve the item addressed by the instance suffix after the block token.
+ * Stale instances, such as a click on an item removed after it was rendered,
+ * resolve to nothing and the click is dropped. */
+static bool find_clicked_item(const struct block *block, const char *suffix,
+                              size_t len, const struct block_item **item,
+                              size_t *position) {
+    if (!block->list_mode) {
+        if (len != 0 || block->item_count != 1) {
+            return false;
+        }
+        *item = &block->items[0];
+        *position = 0;
+        return (*item)->state.visible;
+    }
+    if (len < 2) {
+        return false;
+    }
+    if (suffix[0] == ':') {
+        for (size_t index = 0; index < block->item_count; index++) {
+            const struct block_item *candidate = &block->items[index];
+            if (candidate->id != NULL && candidate->id_len == len - 1 &&
+                memcmp(candidate->id, suffix + 1, len - 1) == 0) {
+                *item = candidate;
+                *position = index;
+                return candidate->state.visible;
+            }
+        }
+        return false;
+    }
+    if (suffix[0] != '#' || len > 4) {
+        return false;
+    }
+    size_t number = 0;
+    for (size_t index = 1; index < len; index++) {
+        if (suffix[index] < '0' || suffix[index] > '9') {
+            return false;
+        }
+        number = number * 10U + (size_t)(suffix[index] - '0');
+    }
+    if (number == 0 || number > block->item_count ||
+        block->items[number - 1].id != NULL) {
+        return false;
+    }
+    *item = &block->items[number - 1];
+    *position = number - 1;
+    return (*item)->state.visible;
+}
+
 static void dispatch_click(struct app *app, const char *json, size_t len) {
     yyjson_read_err error;
     yyjson_doc *document = yyjson_read_opts((char *)json, len, 0, NULL, &error);
@@ -1951,16 +2449,22 @@ static void dispatch_click(struct app *app, const char *json, size_t len) {
     }
     const char *name = yyjson_get_str(name_value);
     const char *instance = yyjson_get_str(instance_value);
+    const size_t instance_len = yyjson_get_len(instance_value);
     struct block *target = NULL;
     for (size_t index = 0; index < app->current->block_count; index++) {
         struct block *block = app->current->blocks[index];
         if (!block->faulted && strcmp(block->name, name) == 0 &&
-            strcmp(block->token, instance) == 0) {
+            instance_len >= I3SD_TOKEN_LEN &&
+            memcmp(block->token, instance, I3SD_TOKEN_LEN) == 0) {
             target = block;
             break;
         }
     }
-    if (target == NULL || target->click_ref == LUA_NOREF) {
+    const struct block_item *item = NULL;
+    size_t position = 0;
+    if (target == NULL || target->click_ref == LUA_NOREF ||
+        !find_clicked_item(target, instance + I3SD_TOKEN_LEN,
+                           instance_len - I3SD_TOKEN_LEN, &item, &position)) {
         yyjson_doc_free(document);
         return;
     }
@@ -1995,7 +2499,16 @@ static void dispatch_click(struct app *app, const char *json, size_t len) {
         }
         lua_setfield(lua, -2, "modifiers");
     }
-    if (lua_pcall(lua, 3, 0, 0) != 0) {
+    /* Single-state blocks keep the three-argument form; list items add their
+     * id, or their 1-based position when they have none. */
+    if (!target->list_mode) {
+        lua_pushnil(lua);
+    } else if (item->id != NULL) {
+        lua_pushlstring(lua, item->id, item->id_len);
+    } else {
+        lua_pushinteger(lua, (lua_Integer)position + 1);
+    }
+    if (lua_pcall(lua, 4, 0, 0) != 0) {
         i3sd_log_lua_error(target, "click");
         i3sd_fault_block(target);
     }
