@@ -135,6 +135,51 @@ are validated and serialized. A failing call raises and leaves the rendered
 items untouched. All blocks of a configuration together reserve at most 256
 items; ``max_items`` defaults to 1.
 
+Directory blocks
+----------------
+
+``directory_blocks`` lets external processes add, update and remove bar items
+by managing plain files. Every regular file in the directory becomes one item,
+ordered by file name:
+
+.. code:: lua
+
+   local directory_blocks = require("i3sd.modules.directory_blocks")
+   local path = os.getenv("XDG_RUNTIME_DIR") .. "/i3sd-blocks"
+
+   directory_blocks {
+       path = path,       -- this is also the default
+       max_items = 16,    -- the lexically first files are shown
+       max_bytes = 512,   -- per file, at most 4096
+       click = function(ctx, button, event, name)
+           if button == 2 then
+               os.remove(path .. "/" .. name) -- middle click dismisses
+           end
+       end,
+   }
+
+.. code:: console
+
+   $ touch "$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"          # shows "10-vpn"
+   $ printf 'VPN up\nVPN\n#00ff00\n' >"$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"
+   $ rm "$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"             # item disappears
+
+An empty file shows its name. Otherwise the i3blocks convention applies: the
+first line is ``full_text``, the second ``short_text`` and the third a color;
+an invalid color is ignored and an empty first line hides the item. Content is
+cut at ``max_bytes`` and text that is not UTF-8 falls back to the file name.
+Names starting with ``.`` or ending in ``~`` are ignored, so producers can
+update atomically by writing ``.name.tmp`` and renaming it to ``name``.
+Symlinks, FIFOs, devices and subdirectories never render.
+
+The directory is watched natively and no Lua runs when files change: a change
+costs one ``open``/``fstat``/``read``/``close`` and identical rewrites do not
+render. Changes become visible when the writer closes the file or renames it
+into place. The directory is created with mode ``0700`` when the configuration
+becomes active (``--check`` never creates it) and is refused unless it is owned
+by the current user and not group or world writable. If it is deleted or moved
+away, its items disappear and it is recreated.
+
 The ``battery`` module refreshes immediately on Linux power-supply change
 events and keeps a slower periodic sample as a resynchronization fallback.
 

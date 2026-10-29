@@ -77,6 +77,7 @@ executable(
     'i3sd',
     'src/collectors.c',
     'src/dbus.c',
+    'src/directory_feed.c',
     'src/main.c',
     'src/nvidia.c',
     'src/pipewire.c',
@@ -147,6 +148,15 @@ test(
     timeout: 15,
 )
 test(
+    'directory-blocks',
+    find_program('tests/test_directory_blocks.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/directory-blocks.lua',
+    ],
+    timeout: 30,
+)
+test(
     'config-recovery',
     find_program('tests/test_config_recovery.sh'),
     args: [
@@ -181,6 +191,7 @@ test(
 install_data(
     'lua/i3sd/modules/clock.lua',
     'lua/i3sd/modules/cpu.lua',
+    'lua/i3sd/modules/directory_blocks.lua',
     'lua/i3sd/modules/filesystem.lua',
     'lua/i3sd/modules/memory.lua',
     'lua/i3sd/modules/nvidia.lua',

@@ -865,6 +865,20 @@ race without polling; subsequent changes after that resnapshot are normal live e
 File-change bursts may be coalesced into one callback/reload using a short one-shot timer; there is no periodic polling
 fallback.
 
+Kernel watches on the shared instance are reference-counted per watch descriptor and added with ``IN_MASK_ADD``, because
+inotify returns one descriptor per inode: the configuration watch and any number of consumers of the same directory share it,
+and it is removed only with its last reference. A reload acquires the candidate's watches before the old generation releases its
+own, so a directory kept across reloads never loses its kernel watch.
+
+A *directory feed* (``directory_blocks``) is a native item producer: it renders the regular files of one directory as the items
+of its block without entering Lua. Staging only records it. Activation creates the directory (mode ``0700``), verifies through
+the opened descriptor that it is owned by the effective user and not group/world writable, arms the watch and then lists the
+directory, so no change can fall between listing and watching. Afterwards each ``IN_CLOSE_WRITE``/``IN_MOVED_TO`` re-reads one
+file and ``IN_DELETE``/``IN_MOVED_FROM`` removes one item; a full rescan happens only at activation, after ``IN_Q_OVERFLOW``
+and when a removal may reveal a file beyond ``max_items``. Files are opened by path with ``O_NONBLOCK | O_NOFOLLOW`` and only
+regular files render. No directory descriptor is held, because it would pin the directory and delay ``IN_DELETE_SELF``.
+When the directory is deleted or moved away the feed clears its items and recreates and re-watches it once.
+
 ``IN_Q_OVERFLOW`` invalidates assumptions derived from all inotify event streams. On overflow, revalidate every logical file
 watch and invoke each affected logical watcher at most once to force consumers to resnapshot current state.
 

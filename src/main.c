@@ -3,6 +3,7 @@
 #include "collectors.h"
 #include "config.h"
 #include "dbus.h"
+#include "directory_feed.h"
 #include "i3sd/buffer.h"
 #include "i3sd/click.h"
 #include "i3sd/id_set.h"
@@ -852,6 +853,11 @@ static int lua_context_set(lua_State *lua) {
     struct block *block = context->block;
     luaL_checktype(lua, 2, LUA_TTABLE);
 
+    if (block->feed != NULL) {
+        return luaL_error(lua, "block %s items come from a directory watch",
+                          block->name);
+    }
+
     bool list_mode;
     const size_t count = classify_set_argument(lua, block, &list_mode);
     if (block->items == NULL) {
@@ -990,6 +996,200 @@ fail:
         snprintf(error, sizeof(error), "%s", detail);
     }
     return luaL_error(lua, "%s", error);
+}
+
+bool i3sd_valid_color(const char *color) { return valid_color(color); }
+
+int i3sd_compare_item_ids(const char *left, size_t left_len, const char *right,
+                          size_t right_len) {
+    const int order =
+        memcmp(left, right, left_len < right_len ? left_len : right_len);
+    if (order != 0) {
+        return order;
+    }
+    return left_len < right_len ? -1 : left_len > right_len ? 1 : 0;
+}
+
+static bool block_items_live(const struct block *block) {
+    return !block->generation->staging &&
+           block->generation->app->current == block->generation;
+}
+
+static void block_items_changed(struct block *block) {
+    if (block_items_live(block)) {
+        block->generation->app->render_dirty = true;
+    }
+}
+
+/* Binary search over the id-sorted items of a native producer. */
+static bool find_item(const struct block *block, const char *id, size_t id_len,
+                      size_t *position) {
+    size_t low = 0;
+    size_t high = block->item_count;
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2;
+        const struct block_item *item = &block->items[middle];
+        const int order =
+            i3sd_compare_item_ids(item->id, item->id_len, id, id_len);
+        if (order == 0) {
+            *position = middle;
+            return true;
+        }
+        if (order < 0) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    *position = low;
+    return false;
+}
+
+static void set_text_view(struct text_view *view, const char *text) {
+    if (text != NULL) {
+        view->data = text;
+        view->len = strlen(text);
+        view->present = true;
+    }
+}
+
+enum i3sd_put_result i3sd_block_put_item(struct block *block, const char *id,
+                                         size_t id_len,
+                                         const struct i3sd_item_text *text) {
+    if (block->items == NULL) {
+        block->items = calloc(block->max_items, sizeof(*block->items));
+        if (block->items == NULL) {
+            return I3SD_PUT_FAILED;
+        }
+    }
+    block->list_mode = true;
+
+    /* Text from files goes through the same compare-before-allocate path
+     * as ctx:set, so rewriting identical content costs no allocation. */
+    struct state_view view = {0};
+    view.id.data = id;
+    view.id.len = id_len;
+    view.id.present = true;
+    set_text_view(&view.text[TEXT_FULL], text->full_text);
+    set_text_view(&view.text[TEXT_SHORT], text->short_text);
+    set_text_view(&view.text[TEXT_COLOR], text->color);
+
+    size_t position;
+    const bool found = find_item(block, id, id_len, &position);
+    if (found && state_matches_view(&block->items[position].state, &view)) {
+        return I3SD_PUT_UNCHANGED;
+    }
+    if (!found && block->item_count == block->max_items &&
+        position == block->item_count) {
+        return I3SD_PUT_FULL;
+    }
+
+    char error[I3SD_ERROR_MAX];
+    struct block_item item = {0};
+    if (!materialize_item(block, true, position, &view, &item, error,
+                          sizeof(error))) {
+        debug_log(block->generation->app, "block %s item %.*s: %s",
+                  block->name, (int)id_len, id, error);
+        return I3SD_PUT_FAILED;
+    }
+
+    enum i3sd_put_result result = I3SD_PUT_CHANGED;
+    if (found) {
+        block_item_destroy(&block->items[position]);
+    } else {
+        /* A full block keeps the lexically first ids. */
+        if (block->item_count == block->max_items) {
+            block_item_destroy(&block->items[--block->item_count]);
+            result = I3SD_PUT_EVICTED;
+        }
+        memmove(&block->items[position + 1], &block->items[position],
+                (block->item_count - position) * sizeof(block->items[0]));
+        block->item_count++;
+    }
+    block->items[position] = item;
+    block_items_changed(block);
+    return result;
+}
+
+bool i3sd_block_remove_item(struct block *block, const char *id,
+                            size_t id_len) {
+    size_t position;
+    if (!find_item(block, id, id_len, &position)) {
+        return false;
+    }
+    block_item_destroy(&block->items[position]);
+    block->item_count--;
+    memmove(&block->items[position], &block->items[position + 1],
+            (block->item_count - position) * sizeof(block->items[0]));
+    block->items[block->item_count] = (struct block_item){0};
+    block_items_changed(block);
+    return true;
+}
+
+void i3sd_block_clear_items(struct block *block) {
+    if (block->item_count != 0) {
+        block_items_clear(block);
+        block_items_changed(block);
+    }
+}
+
+/* Attach a native producer that renders the regular files of a directory as
+ * this block's items. Staging only records it; the directory is created,
+ * opened and watched when the configuration commits, so --check stays free of
+ * filesystem side effects. */
+static int lua_context_watch_directory(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct block *block = context->block;
+    struct generation *generation = block->generation;
+    luaL_checktype(lua, 2, LUA_TTABLE);
+    static const char *const fields[] = {"path", "max_bytes"};
+    check_strict_table(lua, 2, fields, sizeof(fields) / sizeof(fields[0]));
+    if (!generation->staging) {
+        return luaL_error(lua, "directory watches must be created in init");
+    }
+    if (block->feed != NULL) {
+        return luaL_error(lua, "block %s already watches a directory",
+                          block->name);
+    }
+    if (generation->subscription_count == I3SD_MAX_TIMERS) {
+        return luaL_error(lua, "subscription limit reached");
+    }
+
+    lua_getfield(lua, 2, "path");
+    size_t path_len;
+    const char *path = luaL_checklstring(lua, -1, &path_len);
+    if (path_len == 0 || path[0] != '/' || path_len >= PATH_MAX ||
+        !valid_text(path, path_len, PATH_MAX)) {
+        return luaL_error(lua, "directory path must be an absolute UTF-8 path");
+    }
+    size_t max_bytes = 512;
+    lua_getfield(lua, 2, "max_bytes");
+    if (!lua_isnil(lua, -1)) {
+        const lua_Integer value = luaL_checkinteger(lua, -1);
+        if (value < 1 || value > 4096) {
+            return luaL_error(lua, "max_bytes must be between 1 and 4096");
+        }
+        max_bytes = (size_t)value;
+    }
+
+    struct directory_feed *feed = calloc(1, sizeof(*feed));
+    char *copy = copy_bytes(path, path_len);
+    if (feed == NULL || copy == NULL) {
+        free(feed);
+        free(copy);
+        return luaL_error(lua, "out of memory creating directory watch");
+    }
+    *feed = (struct directory_feed){
+        .next = generation->directory_feeds,
+        .block = block,
+        .path = copy,
+        .max_bytes = max_bytes,
+        .wd = -1,
+    };
+    generation->directory_feeds = feed;
+    generation->subscription_count++;
+    block->feed = feed;
+    return 0;
 }
 
 static int lua_timer_cancel(lua_State *lua) {
@@ -1727,6 +1927,7 @@ static void register_lua_api(struct generation *generation) {
         {"_watch_power_profiles", lua_context_watch_power_profiles},
         {"_watch_power_supply", lua_context_watch_power_supply},
         {"_watch_pipewire_volume", lua_context_watch_pipewire_volume},
+        {"_watch_directory", lua_context_watch_directory},
         {"_set_power_profile", lua_context_set_power_profile},
         {NULL, NULL},
     };
@@ -1981,6 +2182,11 @@ static void generation_destroy(struct generation *generation) {
          subscription != NULL; subscription = subscription->next) {
         subscription->cancelled = true;
     }
+    for (struct directory_feed *feed = generation->directory_feeds;
+         feed != NULL; feed = feed->next) {
+        feed->cancelled = true;
+        i3sd_directory_feed_close(feed);
+    }
     i3sd_dbus_generation_deactivate(generation->dbus);
     i3sd_pipewire_retire_generation(generation->app->pipewire, generation);
     /* Lua finalizers can still inspect native handles, so close Lua first. */
@@ -2014,6 +2220,13 @@ static void generation_destroy(struct generation *generation) {
         struct power_supply_subscription *next = supply_subscription->next;
         free(supply_subscription);
         supply_subscription = next;
+    }
+    struct directory_feed *feed = generation->directory_feeds;
+    while (feed != NULL) {
+        struct directory_feed *next = feed->next;
+        free(feed->path);
+        free(feed);
+        feed = next;
     }
     for (size_t index = 0; index < generation->block_count; index++) {
         block_destroy(generation->blocks[index]);
@@ -2174,6 +2387,10 @@ void i3sd_fault_block(struct block *block) {
     }
     i3sd_dbus_cancel_owner(generation->dbus, block);
     i3sd_pipewire_cancel_owner(generation->app->pipewire, block);
+    if (block->feed != NULL) {
+        block->feed->cancelled = true;
+        i3sd_directory_feed_close(block->feed);
+    }
     block_items_clear(block);
     generation->app->render_dirty = true;
 }
@@ -2226,6 +2443,14 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
                             activation_ns + timer->delay_ns, interval, timer)) {
             fprintf(stderr, "i3sd: unable to activate configured timer\n");
             i3sd_fault_block(timer->block);
+        }
+    }
+    /* Watches are acquired before the old generation releases its own, so a
+     * directory kept across a reload never loses its kernel watch. */
+    for (struct directory_feed *feed = candidate->directory_feeds;
+         feed != NULL; feed = feed->next) {
+        if (!feed->cancelled && !i3sd_directory_feed_activate(feed)) {
+            i3sd_fault_block(feed->block);
         }
     }
     for (size_t index = 0; index < candidate->block_count; index++) {
@@ -2617,17 +2842,37 @@ static void handle_inotify(struct app *app) {
         while (offset < (size_t)count) {
             struct inotify_event *event =
                 (struct inotify_event *)(bytes + offset);
+            offset += sizeof(*event) + event->len;
             if ((event->mask & IN_Q_OVERFLOW) != 0) {
+                /* Lost events invalidate every stream: resynchronize all. */
                 debug_log(app, "inotify queue overflow; rechecking config");
                 app->reload_dirty = true;
-            } else if (event->len > 0 &&
-                       strcmp(event->name, app->config_base) == 0) {
+                for (struct directory_feed *feed =
+                         app->current != NULL ? app->current->directory_feeds
+                                              : NULL;
+                     feed != NULL; feed = feed->next) {
+                    i3sd_directory_feed_rescan(feed);
+                }
+                continue;
+            }
+            if (event->wd == app->config_watch && event->len > 0 &&
+                strcmp(event->name, app->config_base) == 0) {
                 debug_log(app, "config event mask=0x%08x", event->mask);
                 if ((event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) != 0) {
                     app->reload_dirty = true;
                 }
             }
-            offset += sizeof(*event) + event->len;
+            if ((event->mask & IN_IGNORED) != 0) {
+                i3sd_watch_forget(app, event->wd);
+            }
+            /* Only the current generation reacts; a staged candidate lists
+             * its directories again when it is activated. */
+            for (struct directory_feed *feed =
+                     app->current != NULL ? app->current->directory_feeds
+                                          : NULL;
+                 feed != NULL; feed = feed->next) {
+                i3sd_directory_feed_event(feed, event);
+            }
         }
     }
 }
@@ -2765,10 +3010,11 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
     }
     /* IN_CREATE/IN_ATTRIB can arrive while an editor still owns a partial file.
      * Reload only after a writer closes or an atomic replacement lands. */
+    /* The registry keeps this watch alive if a directory feed shares it. */
     app->config_watch =
-        inotify_add_watch(app->inotify_fd, app->config_dir,
-                          IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE_SELF |
-                              IN_MOVE_SELF);
+        i3sd_watch_acquire(app, app->config_dir,
+                           IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE_SELF |
+                               IN_MOVE_SELF);
     if (app->config_watch < 0) {
         return false;
     }

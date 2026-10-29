@@ -23,6 +23,7 @@
  * block limit preserves the guarantee that a full frame fits its 2 MiB cap. */
 #define I3SD_MAX_FRAME_ITEMS 256U
 #define I3SD_MAX_ITEM_ID 255U
+#define I3SD_MAX_WATCHES 1024U
 #define I3SD_MAX_TIMERS 4096U
 #define I3SD_CONFIG_ERROR_MAX 6144U
 #define I3SD_POWER_PROFILE_LIMIT 16U
@@ -165,6 +166,43 @@ struct block_item {
     struct i3sd_buffer fragment;
 };
 
+/* A directory whose regular files are rendered as the items of one block. */
+struct directory_feed {
+    struct directory_feed *next;
+    struct block *block;
+    char *path;
+    size_t max_bytes;
+    int wd;
+    /* More matching files exist than the block can show. */
+    bool overflowed;
+    /* A rescan is running, so removals must not start another one. */
+    bool scanning;
+    bool cancelled;
+};
+
+/* Native producers set items from plain NUL-terminated text. */
+struct i3sd_item_text {
+    const char *full_text;
+    const char *short_text; /* optional */
+    const char *color;      /* optional, already validated */
+};
+
+enum i3sd_put_result {
+    I3SD_PUT_UNCHANGED,
+    I3SD_PUT_CHANGED,
+    I3SD_PUT_EVICTED, /* inserted after dropping the last item */
+    I3SD_PUT_FULL,    /* sorts after every item of a full block */
+    I3SD_PUT_FAILED,
+};
+
+/* A kernel inotify watch shared by every consumer of the same directory.
+ * inotify returns one descriptor per inode, so removing it is only safe once
+ * the last consumer is gone. */
+struct watch_entry {
+    int wd;
+    size_t refs;
+};
+
 struct block {
     struct generation *generation;
     char *name;
@@ -184,6 +222,8 @@ struct block {
     size_t item_count;
     struct block_item *items;
     struct block_item *spare;
+    /* Set when a native producer owns the items instead of ctx:set. */
+    struct directory_feed *feed;
     bool list_mode;
 };
 
@@ -203,6 +243,7 @@ struct generation {
     struct systemd_subscription *systemd_subscriptions;
     struct power_profiles_subscription *power_profiles_subscriptions;
     struct power_supply_subscription *power_supply_subscriptions;
+    struct directory_feed *directory_feeds;
     struct i3sd_dbus_generation *dbus;
     size_t timer_count;
     size_t subscription_count;
@@ -224,6 +265,8 @@ struct app {
     int signal_fd;
     int inotify_fd;
     int config_watch;
+    struct watch_entry watches[I3SD_MAX_WATCHES];
+    size_t watch_count;
     char *config_path;
     char *config_dir;
     char *config_base;
@@ -259,5 +302,17 @@ struct app {
 /* Event sources use these callbacks to preserve block fault isolation. */
 void i3sd_fault_block(struct block *block);
 void i3sd_log_lua_error(struct block *block, const char *phase);
+
+/* Item access for native producers. Items stay sorted by id, compared as
+ * byte strings, and render requests follow the usual live-generation rule. */
+int i3sd_compare_item_ids(const char *left, size_t left_len, const char *right,
+                          size_t right_len);
+enum i3sd_put_result i3sd_block_put_item(struct block *block, const char *id,
+                                         size_t id_len,
+                                         const struct i3sd_item_text *text);
+bool i3sd_block_remove_item(struct block *block, const char *id,
+                            size_t id_len);
+void i3sd_block_clear_items(struct block *block);
+bool i3sd_valid_color(const char *color);
 
 #endif
