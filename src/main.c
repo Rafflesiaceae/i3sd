@@ -1521,8 +1521,10 @@ static int lua_context_spawn(lua_State *lua) {
     const int argv_index = lua_gettop(lua);
     const size_t argc = lua_objlen(lua, argv_index);
     if (argc == 0 || argc > I3SD_SPAWN_ARG_LIMIT) {
-        return luaL_error(lua, "spawn argv must contain 1 to %u entries",
-                          I3SD_SPAWN_ARG_LIMIT);
+        /* Lua's formatter knows %d but no length modifiers or %u, so the
+         * numbers in these messages are passed as int. */
+        return luaL_error(lua, "spawn argv must contain 1 to %d entries",
+                          (int)I3SD_SPAWN_ARG_LIMIT);
     }
 
     /* Reject sparse or keyed argv tables so execution is deterministic. */
@@ -1551,8 +1553,8 @@ static int lua_context_spawn(lua_State *lua) {
     for (size_t index = 1; index <= argc; index++) {
         lua_rawgeti(lua, argv_index, (int)index);
         if (lua_type(lua, -1) != LUA_TSTRING) {
-            return luaL_error(lua, "spawn argv entry %zu must be a string",
-                              index);
+            return luaL_error(lua, "spawn argv entry %d must be a string",
+                              (int)index);
         }
         size_t argument_len;
         const char *argument = lua_tolstring(lua, -1, &argument_len);
@@ -1562,13 +1564,13 @@ static int lua_context_spawn(lua_State *lua) {
         if (argument_len > I3SD_SPAWN_ARG_BYTES ||
             memchr(argument, '\0', argument_len) != NULL) {
             return luaL_error(lua,
-                              "spawn argv entry %zu must be NUL-free and at "
-                              "most %u bytes",
-                              index, I3SD_SPAWN_ARG_BYTES);
+                              "spawn argv entry %d must be NUL-free and at "
+                              "most %d bytes",
+                              (int)index, (int)I3SD_SPAWN_ARG_BYTES);
         }
         if (argument_len + 1 > I3SD_SPAWN_ARGV_BYTES - argv_bytes) {
-            return luaL_error(lua, "spawn argv exceeds the %u-byte limit",
-                              I3SD_SPAWN_ARGV_BYTES);
+            return luaL_error(lua, "spawn argv exceeds the %d-byte limit",
+                              (int)I3SD_SPAWN_ARGV_BYTES);
         }
         argv_bytes += argument_len + 1;
         lua_pop(lua, 1);
@@ -1581,8 +1583,8 @@ static int lua_context_spawn(lua_State *lua) {
         luaL_checktype(lua, -1, LUA_TSTRING);
         input = lua_tolstring(lua, -1, &input_len);
         if (input_len > I3SD_SPAWN_INPUT_BYTES) {
-            return luaL_error(lua, "spawn stdin exceeds the %u-byte limit",
-                              I3SD_SPAWN_INPUT_BYTES);
+            return luaL_error(lua, "spawn stdin exceeds the %d-byte limit",
+                              (int)I3SD_SPAWN_INPUT_BYTES);
         }
     }
 
@@ -1594,8 +1596,8 @@ static int lua_context_spawn(lua_State *lua) {
         if (!isfinite(requested) || requested < 1 ||
             requested > I3SD_SPAWN_OUTPUT_BYTES ||
             floor(requested) != requested) {
-            return luaL_error(lua, "spawn stdout_limit must be from 1 to %u",
-                              I3SD_SPAWN_OUTPUT_BYTES);
+            return luaL_error(lua, "spawn stdout_limit must be from 1 to %d",
+                              (int)I3SD_SPAWN_OUTPUT_BYTES);
         }
         output_limit = (size_t)requested;
     }
@@ -1664,8 +1666,8 @@ static int lua_context_set_power_profile(lua_State *lua) {
     if (!valid_text(profile, profile_len, I3SD_POWER_PROFILE_NAME_LIMIT)) {
         return luaL_error(lua,
                           "power profile must be valid, NUL-free UTF-8 "
-                          "of at most %u bytes",
-                          I3SD_POWER_PROFILE_NAME_LIMIT);
+                          "of at most %d bytes",
+                          (int)I3SD_POWER_PROFILE_NAME_LIMIT);
     }
     struct app *app = block->generation->app;
     const bool current = app->current == block->generation && !block->faulted;

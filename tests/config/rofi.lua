@@ -94,5 +94,19 @@ block {
         local ok, err = pcall(ctx.spawn, ctx, { argv = { "true" }, timeout = 0 },
             function() end)
         assert(not ok and err:find("positive number", 1, true), err)
+
+        -- Argument errors must spell out their numbers.
+        local function expect_error(request, message)
+            local spawned, failure = pcall(ctx.spawn, ctx, request, function() end)
+            assert(not spawned and failure:find(message, 1, true), failure)
+        end
+        local oversized = {}
+        for index = 1, 65 do
+            oversized[index] = "true"
+        end
+        expect_error({ argv = oversized }, "must contain 1 to 64 entries")
+        expect_error({ argv = { "true", 5 } }, "argv entry 2 must be a string")
+        expect_error({ argv = { "true", ("x"):rep(4097) } }, "at most 4096 bytes")
+        expect_error({ argv = { "true" }, stdout_limit = 0 }, "from 1 to 65536")
     end,
 }
