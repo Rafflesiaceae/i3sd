@@ -73,7 +73,9 @@ if nvml.found()
     runtime_dependencies += nvml
 endif
 
-executable(
+# Tests receive the daemon as this target rather than as a path string, so
+# meson rebuilds it before running them.
+i3sd = executable(
     'i3sd',
     'src/collectors.c',
     'src/dbus.c',
@@ -104,7 +106,7 @@ test(
     'config-check',
     find_program('tests/check_config.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/basic.lua',
     ],
 )
@@ -112,7 +114,7 @@ test(
     'pipewire-config-check',
     find_program('tests/check_config.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/pipewire.lua',
     ],
 )
@@ -120,20 +122,20 @@ test(
     'nvidia-config-check',
     find_program('tests/check_config.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/nvidia.lua',
     ],
 )
 test(
     'example-configs',
     find_program('tests/check_examples.sh'),
-    args: [meson.current_build_dir() / 'i3sd', meson.current_source_dir()],
+    args: [i3sd, meson.current_source_dir()],
 )
 test(
     'spawn-callback',
     find_program('tests/test_rofi.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/rofi.lua',
         meson.current_source_dir() / 'tests/fake_rofi.sh',
     ],
@@ -142,7 +144,7 @@ test(
     'item-lists',
     find_program('tests/test_item_lists.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/item-lists.lua',
         meson.current_source_dir() / 'tests/config/item-budget.lua',
     ],
@@ -152,7 +154,7 @@ test(
     'directory-blocks',
     find_program('tests/test_directory_blocks.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/directory-blocks.lua',
     ],
     timeout: 30,
@@ -161,7 +163,7 @@ test(
     'realtime-timers',
     find_program('tests/test_realtime.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/realtime.lua',
     ],
     timeout: 15,
@@ -170,7 +172,7 @@ test(
     'config-recovery',
     find_program('tests/test_config_recovery.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/reload-recovery.lua',
     ],
     timeout: 15,
@@ -179,7 +181,7 @@ test(
     'global-settings',
     find_program('tests/test_global_settings.sh'),
     args: [
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/global-settings.lua',
         meson.current_source_dir() / 'tests/config/basic.lua',
     ],
@@ -191,7 +193,7 @@ test(
     find_program('dbus-run-session'),
     args: [
         meson.current_source_dir() / 'tests/test_dbus.sh',
-        meson.current_build_dir() / 'i3sd',
+        i3sd,
         meson.current_source_dir() / 'tests/config/dbus.lua',
         busctl.full_path(),
     ],
