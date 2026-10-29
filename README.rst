@@ -78,6 +78,18 @@ Copyable configurations are available under ``examples/``. See ``PLAN.rst`` for 
 polling. It displays one of ``▏ ▎ ▍ ▌ ▋ ▊ ▉ █`` for the volume, ``🔇`` while
 muted, and remains hidden while PipeWire or a default sink is unavailable.
 
+Besides ``ctx:after(seconds, fn)`` and ``ctx:every(seconds, fn)``, which count
+awake monotonic time, blocks can schedule work on the wall clock.
+``ctx:at_realtime(unix_seconds, fn)`` runs ``fn`` once when the realtime clock
+reaches an absolute timestamp, and ``ctx:on_clock_change(fn)`` runs ``fn`` after
+the realtime clock jumped, for example when it was set or the machine resumed
+from suspend, so wall-clock schedules can be recomputed. Both share one timerfd
+that only exists while they are in use. The ``clock`` module uses them to flip
+exactly on the second or minute boundary; its ``interval`` aligns updates to
+multiples of that many seconds since the epoch. After a suspend, i3sd also runs
+every block's ``update`` once so that values do not stay stale until the next
+interval. Keep the returned handles referenced: collecting one cancels it.
+
 Lua modules can start bounded asynchronous child processes from a block
 callback, up to eight at a time. ``ctx:spawn`` returns ``nil`` during staging,
 when all eight are running, or when process setup fails:

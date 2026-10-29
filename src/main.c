@@ -15,6 +15,7 @@
 #include "power_profiles.h"
 #include "power_supply_events.h"
 #include "runtime.h"
+#include "realtime.h"
 #include "spawn.h"
 #include "systemd.h"
 
@@ -52,6 +53,10 @@
 #define I3SD_MAX_CONFIG (1024U * 1024U)
 #define I3SD_EPOLL_EVENTS 64
 #define I3SD_TIMER_BUDGET 256U
+/* Clock reads slower than this are retried instead of trusted. */
+#define I3SD_SUSPEND_BRACKET_NS 10000000ULL
+/* Boottime gaining this much over monotonic time indicates a suspend. */
+#define I3SD_SUSPEND_GAP_NS 250000000ULL
 #define I3SD_OUTPUT_BUDGET (1024U * 1024U)
 #define I3SD_SPAWN_ARG_LIMIT 64U
 #define I3SD_SPAWN_ARG_BYTES 4096U
@@ -107,6 +112,11 @@ static const char power_profiles_handle_metatable[] =
 static const char power_supply_handle_metatable[] =
     "i3sd.power_supply_handle";
 static const char spawn_handle_metatable[] = "i3sd.spawn_handle";
+static const char clock_observer_metatable[] = "i3sd.clock_observer";
+
+struct lua_clock_observer_handle {
+    struct clock_observer *observer;
+};
 
 static bool make_nonblocking(int fd);
 static void push_uint64(lua_State *lua, uint64_t value);
@@ -1198,7 +1208,9 @@ static int lua_timer_cancel(lua_State *lua) {
     struct lua_timer_handle *handle = luaL_checkudata(lua, 1, timer_metatable);
     if (handle->timer != NULL && !handle->timer->cancelled) {
         struct app *app = handle->timer->block->generation->app;
-        i3sd_timer_cancel(&app->timer_heap, &handle->timer->timer);
+        i3sd_timer_cancel(handle->timer->realtime ? &app->realtime_heap
+                                                  : &app->timer_heap,
+                          &handle->timer->timer);
         handle->timer->cancelled = true;
     }
     return 0;
@@ -1272,6 +1284,85 @@ static int lua_context_after(lua_State *lua) {
 
 static int lua_context_every(lua_State *lua) {
     return create_lua_timer(lua, true);
+}
+
+/* ctx:at_realtime(unix_seconds, fn) fires fn once when CLOCK_REALTIME
+ * reaches the absolute timestamp, also after clock jumps and suspends. */
+static int lua_context_at_realtime(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct generation *generation = context->block->generation;
+    uint64_t deadline_ns;
+    if (!seconds_to_ns(lua, 2, true, &deadline_ns)) {
+        return luaL_error(lua, "invalid realtime timestamp");
+    }
+    luaL_checktype(lua, 3, LUA_TFUNCTION);
+    if (generation->timer_count == I3SD_MAX_TIMERS) {
+        return luaL_error(lua, "timer limit reached");
+    }
+
+    struct logical_timer *timer = calloc(1, sizeof(*timer));
+    if (timer == NULL) {
+        return luaL_error(lua, "out of memory creating timer");
+    }
+    timer->block = context->block;
+    timer->realtime = true;
+    timer->realtime_ns = deadline_ns;
+    /* Staged timers join the realtime heap when the generation activates. */
+    if (!generation->staging &&
+        !i3sd_timer_add(&generation->app->realtime_heap, &timer->timer,
+                        deadline_ns, 0, timer)) {
+        free(timer);
+        return luaL_error(lua, "unable to schedule timer");
+    }
+    lua_pushvalue(lua, 3);
+    timer->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
+    timer->next = generation->timers;
+    generation->timers = timer;
+    generation->timer_count++;
+
+    struct lua_timer_handle *handle = lua_newuserdata(lua, sizeof(*handle));
+    handle->timer = timer;
+    luaL_getmetatable(lua, timer_metatable);
+    lua_setmetatable(lua, -2);
+    return 1;
+}
+
+static int lua_clock_observer_cancel(lua_State *lua) {
+    struct lua_clock_observer_handle *handle =
+        luaL_checkudata(lua, 1, clock_observer_metatable);
+    if (handle->observer != NULL) {
+        handle->observer->cancelled = true;
+    }
+    return 0;
+}
+
+/* ctx:on_clock_change(fn) calls fn after CLOCK_REALTIME changed
+ * discontinuously, including after a suspend, so wall-clock schedules can
+ * be recomputed. */
+static int lua_context_on_clock_change(lua_State *lua) {
+    struct lua_context *context = check_context(lua, 1);
+    struct generation *generation = context->block->generation;
+    luaL_checktype(lua, 2, LUA_TFUNCTION);
+    if (generation->subscription_count == I3SD_MAX_TIMERS) {
+        return luaL_error(lua, "subscription limit reached");
+    }
+    struct clock_observer *observer = calloc(1, sizeof(*observer));
+    if (observer == NULL) {
+        return luaL_error(lua, "out of memory creating clock observer");
+    }
+    observer->block = context->block;
+    lua_pushvalue(lua, 2);
+    observer->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
+    observer->next = generation->clock_observers;
+    generation->clock_observers = observer;
+    generation->subscription_count++;
+
+    struct lua_clock_observer_handle *handle =
+        lua_newuserdata(lua, sizeof(*handle));
+    handle->observer = observer;
+    luaL_getmetatable(lua, clock_observer_metatable);
+    lua_setmetatable(lua, -2);
+    return 1;
 }
 
 static int lua_systemd_cancel(lua_State *lua) {
@@ -1948,6 +2039,8 @@ static void register_lua_api(struct generation *generation) {
         {"set", lua_context_set},
         {"after", lua_context_after},
         {"every", lua_context_every},
+        {"at_realtime", lua_context_at_realtime},
+        {"on_clock_change", lua_context_on_clock_change},
         {"sample", lua_context_sample},
         {"spawn", lua_context_spawn},
         {"dbus", lua_context_dbus},
@@ -1969,6 +2062,15 @@ static void register_lua_api(struct generation *generation) {
     lua_setfield(lua, -2, "cancel");
     lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, lua_timer_cancel);
+    lua_setfield(lua, -2, "__gc");
+    lua_pop(lua, 1);
+
+    luaL_newmetatable(lua, clock_observer_metatable);
+    lua_newtable(lua);
+    lua_pushcfunction(lua, lua_clock_observer_cancel);
+    lua_setfield(lua, -2, "cancel");
+    lua_setfield(lua, -2, "__index");
+    lua_pushcfunction(lua, lua_clock_observer_cancel);
     lua_setfield(lua, -2, "__gc");
     lua_pop(lua, 1);
 
@@ -2187,10 +2289,16 @@ static void generation_destroy(struct generation *generation) {
     struct logical_timer *timer = generation->timers;
     while (timer != NULL) {
         if (timer->timer.active) {
-            i3sd_timer_cancel(&generation->app->timer_heap, &timer->timer);
+            i3sd_timer_cancel(timer->realtime ? &generation->app->realtime_heap
+                                              : &generation->app->timer_heap,
+                              &timer->timer);
         }
         timer->cancelled = true;
         timer = timer->next;
+    }
+    for (struct clock_observer *observer = generation->clock_observers;
+         observer != NULL; observer = observer->next) {
+        observer->cancelled = true;
     }
     for (struct systemd_subscription *subscription =
              generation->systemd_subscriptions;
@@ -2224,6 +2332,12 @@ static void generation_destroy(struct generation *generation) {
         struct logical_timer *next = timer->next;
         free(timer);
         timer = next;
+    }
+    struct clock_observer *observer = generation->clock_observers;
+    while (observer != NULL) {
+        struct clock_observer *next = observer->next;
+        free(observer);
+        observer = next;
     }
     struct systemd_subscription *subscription =
         generation->systemd_subscriptions;
@@ -2460,9 +2574,18 @@ static bool commit_generation(struct app *app, struct generation *candidate) {
     }
     for (struct logical_timer *timer = candidate->timers; timer != NULL;
          timer = timer->next) {
+        if (timer->cancelled) {
+            continue;
+        }
         const uint64_t interval = timer->timer.interval_ns;
-        if (!i3sd_timer_add(&app->timer_heap, &timer->timer,
-                            activation_ns + timer->delay_ns, interval, timer)) {
+        const bool added =
+            timer->realtime
+                ? i3sd_timer_add(&app->realtime_heap, &timer->timer,
+                                 timer->realtime_ns, 0, timer)
+                : i3sd_timer_add(&app->timer_heap, &timer->timer,
+                                 activation_ns + timer->delay_ns, interval,
+                                 timer);
+        if (!added) {
             fprintf(stderr, "i3sd: unable to activate configured timer\n");
             i3sd_fault_block(timer->block);
         }
@@ -2798,6 +2921,61 @@ static void read_clicks(struct app *app) {
     }
 }
 
+/* Run every update callback, resynchronizing state after the process or
+ * the machine was stopped. */
+static void refresh_all_blocks(struct app *app, const char *phase) {
+    for (size_t index = 0; index < app->current->block_count; index++) {
+        struct block *block = app->current->blocks[index];
+        if (!call_block_ref(block, block->update_ref, phase, 0)) {
+            i3sd_fault_block(block);
+        }
+    }
+}
+
+/* Sample CLOCK_BOOTTIME - CLOCK_MONOTONIC with a bracketed read. Only
+ * suspend advances boottime alone, so the offset grows by the suspended
+ * time. Returns false when the read was disturbed, e.g. by preemption. */
+static bool sample_suspend_offset(uint64_t *offset_ns) {
+    struct timespec before, boottime, after;
+    if (clock_gettime(CLOCK_MONOTONIC, &before) < 0 ||
+        clock_gettime(CLOCK_BOOTTIME, &boottime) < 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &after) < 0) {
+        return false;
+    }
+    const uint64_t first =
+        (uint64_t)before.tv_sec * 1000000000ULL + (uint64_t)before.tv_nsec;
+    const uint64_t last =
+        (uint64_t)after.tv_sec * 1000000000ULL + (uint64_t)after.tv_nsec;
+    const uint64_t boot = (uint64_t)boottime.tv_sec * 1000000000ULL +
+                          (uint64_t)boottime.tv_nsec;
+    if (last - first > I3SD_SUSPEND_BRACKET_NS) {
+        return false;
+    }
+    *offset_ns = boot - (first + (last - first) / 2);
+    return true;
+}
+
+/* Refresh every block after a suspend. Monotonic timers do not count the
+ * suspended time, so without this the bar would keep showing pre-suspend
+ * values until each block's next interval elapses. */
+static void detect_suspend(struct app *app) {
+    uint64_t offset_ns;
+    if (!sample_suspend_offset(&offset_ns)) {
+        return;
+    }
+    if (offset_ns >= app->suspend_offset_ns + I3SD_SUSPEND_GAP_NS) {
+        debug_log(app, "suspend of %llu ms detected; refreshing",
+                  (unsigned long long)((offset_ns - app->suspend_offset_ns) /
+                                       1000000ULL));
+        app->suspend_offset_ns = offset_ns;
+        refresh_all_blocks(app, "suspend refresh");
+    } else if (offset_ns > app->suspend_offset_ns) {
+        /* Small increases are measurement jitter; follow them so they never
+         * add up to a false suspend signal. */
+        app->suspend_offset_ns = offset_ns;
+    }
+}
+
 static void handle_signals(struct app *app) {
     struct signalfd_siginfo info[16];
     for (;;) {
@@ -2823,14 +3001,7 @@ static void handle_signals(struct app *app) {
                 app->reload_dirty = true;
                 break;
             case SIGCONT:
-                for (size_t block_index = 0;
-                     block_index < app->current->block_count; block_index++) {
-                    struct block *block = app->current->blocks[block_index];
-                    if (!call_block_ref(block, block->update_ref,
-                                        "resume refresh", 0)) {
-                        i3sd_fault_block(block);
-                    }
-                }
+                refresh_all_blocks(app, "resume refresh");
                 break;
             case SIGCHLD: {
                 pid_t child;
@@ -2993,7 +3164,7 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     if (spawn_deadline < deadline) {
         deadline = spawn_deadline;
     }
-    if (app->reload_dirty) {
+    if (app->reload_dirty || app->clock_changed) {
         return 0;
     }
     if (deadline == UINT64_MAX) {
@@ -3067,6 +3238,11 @@ static bool initialize_runtime(struct app *app, const sigset_t *signal_mask) {
         app->spawns[index].output_fd = -1;
         app->spawns[index].callback_ref = LUA_NOREF;
     }
+    /* Retry until an undisturbed sample sets the suspend baseline. */
+    for (int attempt = 0; attempt < 8 &&
+                          !sample_suspend_offset(&app->suspend_offset_ns);
+         attempt++) {
+    }
     return add_epoll_fd(app, app->signal_fd, EPOLLIN, SOURCE_SIGNAL) &&
            (!app->settings.click_events ||
             add_epoll_fd(app, STDIN_FILENO, EPOLLIN | EPOLLERR | EPOLLHUP,
@@ -3086,6 +3262,7 @@ static void run_event_loop(struct app *app) {
         i3sd_power_supply_reconcile(&app->power_supply, now_ns);
         i3sd_pipewire_reconcile(app->pipewire, now_ns);
         i3sd_dbus_reconcile(app->dbus, app->current->dbus, now_ns);
+        i3sd_realtime_reconcile(app);
         int event_count;
         do {
             event_count = epoll_wait(app->epoll_fd, events, I3SD_EPOLL_EVENTS,
@@ -3095,6 +3272,7 @@ static void run_event_loop(struct app *app) {
             fprintf(stderr, "i3sd: epoll_wait failed: %s\n", strerror(errno));
             break;
         }
+        detect_suspend(app);
         for (int index = 0; index < event_count; index++) {
             switch (events[index].data.u64) {
             case SOURCE_SIGNAL:
@@ -3128,6 +3306,9 @@ static void run_event_loop(struct app *app) {
             case SOURCE_PIPEWIRE:
                 i3sd_pipewire_process(app->pipewire, monotonic_now_ns());
                 break;
+            case SOURCE_CLOCK:
+                i3sd_realtime_process(app);
+                break;
             default:
                 if (events[index].data.u64 >= SOURCE_SPAWN_FIRST &&
                     events[index].data.u64 <= SOURCE_SPAWN_LAST) {
@@ -3148,6 +3329,10 @@ static void run_event_loop(struct app *app) {
         i3sd_pipewire_process(app->pipewire, now_ns);
         i3sd_dbus_process(app->dbus, app->current->dbus, now_ns);
         i3sd_spawn_expire(app, now_ns);
+        if (app->clock_changed) {
+            /* A discontinuity reported while arming the timerfd. */
+            i3sd_realtime_process(app);
+        }
         dispatch_timers(app, now_ns);
         if (app->reload_dirty) {
             app->reload_dirty = false;
@@ -3203,6 +3388,8 @@ static void app_destroy(struct app *app) {
     i3sd_nvidia_shutdown();
     i3sd_collectors_shutdown();
     i3sd_spawn_shutdown(app);
+    i3sd_realtime_close(app);
+    i3sd_timer_heap_destroy(&app->realtime_heap);
     i3sd_timer_heap_destroy(&app->timer_heap);
     i3sd_output_destroy(&app->output);
     i3sd_click_framer_destroy(&app->click_framer);
@@ -3296,6 +3483,7 @@ int main(int argc, char **argv) {
         .signal_fd = -1,
         .inotify_fd = -1,
         .config_watch = -1,
+        .clock_fd = -1,
         .power_supply = {.fd = -1},
         .default_settings = {.click_events = true},
     };

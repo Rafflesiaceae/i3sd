@@ -769,6 +769,8 @@ explicitly request that subscription even if it is the only reason to open the s
 fallback remains sufficient. Duplicate resume indications are coalesced.
 
 Ordinary timer deadlines are still not converted to boottime deadlines and do not retroactively catch up for suspended time.
+The current resynchronization path runs every block's ``update`` callback once, as ``SIGCONT`` does; the optional logind
+``PrepareForSleep`` subscription is not implemented.
 
 Polling blocks created by the same configuration generation use the same monotonic activation epoch so compatible intervals
 naturally share wakeups.

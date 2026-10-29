@@ -83,6 +83,7 @@ executable(
     'src/pipewire.c',
     'src/power_profiles.c',
     'src/power_supply_events.c',
+    'src/realtime.c',
     'src/spawn.c',
     'src/systemd.c',
     include_directories: inc,
@@ -155,6 +156,15 @@ test(
         meson.current_source_dir() / 'tests/config/directory-blocks.lua',
     ],
     timeout: 30,
+)
+test(
+    'realtime-timers',
+    find_program('tests/test_realtime.sh'),
+    args: [
+        meson.current_build_dir() / 'i3sd',
+        meson.current_source_dir() / 'tests/config/realtime.lua',
+    ],
+    timeout: 15,
 )
 test(
     'config-recovery',

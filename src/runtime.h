@@ -42,8 +42,9 @@ enum source_cookie {
     SOURCE_POWER_PROFILES = 7,
     SOURCE_PIPEWIRE = 8,
     SOURCE_POWER_SUPPLY = 9,
+    SOURCE_CLOCK = 10,
     /* Each child process slot owns one cookie for its output pipe. */
-    SOURCE_SPAWN_FIRST = 10,
+    SOURCE_SPAWN_FIRST = 11,
     SOURCE_SPAWN_LAST = SOURCE_SPAWN_FIRST + I3SD_MAX_SPAWNS - 1,
     SOURCE_FIXED_MAX = SOURCE_SPAWN_LAST,
 };
@@ -100,6 +101,17 @@ struct logical_timer {
     struct block *block;
     int callback_ref;
     uint64_t delay_ns;
+    /* Realtime timers fire once at realtime_ns on the realtime heap. */
+    uint64_t realtime_ns;
+    bool realtime;
+    bool cancelled;
+};
+
+/* A block callback for discontinuous CLOCK_REALTIME changes. */
+struct clock_observer {
+    struct clock_observer *next;
+    struct block *block;
+    int callback_ref;
     bool cancelled;
 };
 
@@ -255,6 +267,7 @@ struct generation {
     struct systemd_subscription *systemd_subscriptions;
     struct power_profiles_subscription *power_profiles_subscriptions;
     struct power_supply_subscription *power_supply_subscriptions;
+    struct clock_observer *clock_observers;
     struct directory_feed *directory_feeds;
     struct i3sd_dbus_generation *dbus;
     size_t timer_count;
@@ -284,6 +297,14 @@ struct app {
     char *config_base;
     struct generation *current;
     struct i3sd_timer_heap timer_heap;
+    /* Absolute CLOCK_REALTIME deadlines, woken by one shared timerfd. */
+    struct i3sd_timer_heap realtime_heap;
+    int clock_fd; /* -1 while no realtime timer or observer exists */
+    /* Absolute deadline armed on clock_fd, I3SD_CLOCK_SENTINEL or 0. */
+    uint64_t clock_armed_ns;
+    bool clock_changed;
+    /* Last accepted CLOCK_BOOTTIME - CLOCK_MONOTONIC, grown by suspends. */
+    uint64_t suspend_offset_ns;
     struct i3sd_output output;
     struct i3sd_render_limiter render_limiter;
     struct i3sd_click_framer click_framer;
