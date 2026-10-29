@@ -185,6 +185,8 @@ struct i3sd_item_text {
     const char *full_text;
     const char *short_text; /* optional */
     const char *color;      /* optional, already validated */
+    bool pango;
+    bool urgent;
 };
 
 enum i3sd_put_result {

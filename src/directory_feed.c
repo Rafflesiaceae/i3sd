@@ -108,6 +108,54 @@ static char *next_line(char **cursor, char *end) {
     return line;
 }
 
+/* Invalid values leave the last valid setting intact. */
+static void parse_boolean(const char *value, bool *setting) {
+    if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+        *setting = true;
+    } else if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0) {
+        *setting = false;
+    }
+}
+
+/* Tokenize the third line in place: no allocations or generic option map.
+ * Unknown keys and malformed values never fault externally supplied items. */
+static void parse_options(char *options, struct i3sd_item_text *text) {
+    if (options == NULL) {
+        return;
+    }
+    while (*options != '\0') {
+        if (*options == ' ' || *options == '\t') {
+            options++;
+            continue;
+        }
+        char *key = options;
+        while (*options != '\0' && *options != ' ' && *options != '\t') {
+            options++;
+        }
+        if (*options != '\0') {
+            *options++ = '\0';
+        }
+        char *value = strchr(key, '=');
+        if (value == NULL) {
+            /* A bare color keeps the original third-line format working. */
+            if (i3sd_valid_color(key)) {
+                text->color = key;
+            }
+            continue;
+        }
+        *value++ = '\0';
+        if (strcmp(key, "color") == 0) {
+            if (i3sd_valid_color(value)) {
+                text->color = value;
+            }
+        } else if (strcmp(key, "pango") == 0) {
+            parse_boolean(value, &text->pango);
+        } else if (strcmp(key, "urgent") == 0) {
+            parse_boolean(value, &text->urgent);
+        }
+    }
+}
+
 static void put_result(struct directory_feed *feed,
                        enum i3sd_put_result result, const char *name) {
     if (result == I3SD_PUT_EVICTED || result == I3SD_PUT_FULL) {
@@ -117,9 +165,9 @@ static void put_result(struct directory_feed *feed,
     }
 }
 
-/* Read one file and update its item. The i3blocks convention applies: line
- * one is full_text, line two short_text and line three a color. An empty file
- * shows its name instead. */
+/* Read one file and update its item. Line one is full_text, line two
+ * short_text and line three contains options. An empty file shows its name
+ * instead. */
 static void refresh_file(struct directory_feed *feed, const char *name,
                          size_t name_len) {
     /* Files are opened by path because a held directory descriptor would pin
@@ -178,12 +226,11 @@ static void refresh_file(struct directory_feed *feed, const char *name,
         char *end = content + len;
         char *full_text = next_line(&cursor, end);
         char *short_text = next_line(&cursor, end);
-        char *color = next_line(&cursor, end);
+        char *options = next_line(&cursor, end);
         text.full_text = full_text != NULL ? full_text : "";
         text.short_text =
             short_text != NULL && short_text[0] != '\0' ? short_text : NULL;
-        /* External input never faults the block; a bad color is dropped. */
-        text.color = color != NULL && i3sd_valid_color(color) ? color : NULL;
+        parse_options(options, &text);
     }
     put_result(feed, i3sd_block_put_item(feed->block, name, name_len, &text),
                name);

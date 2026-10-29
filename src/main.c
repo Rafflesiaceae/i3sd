@@ -1073,6 +1073,8 @@ enum i3sd_put_result i3sd_block_put_item(struct block *block, const char *id,
     set_text_view(&view.text[TEXT_FULL], text->full_text);
     set_text_view(&view.text[TEXT_SHORT], text->short_text);
     set_text_view(&view.text[TEXT_COLOR], text->color);
+    set_text_view(&view.text[TEXT_MARKUP], text->pango ? "pango" : NULL);
+    view.urgent = text->urgent;
 
     size_t position;
     const bool found = find_item(block, id, id_len, &position);

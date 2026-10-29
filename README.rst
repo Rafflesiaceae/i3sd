@@ -161,13 +161,29 @@ ordered by file name:
 .. code:: console
 
    $ touch "$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"          # shows "10-vpn"
-   $ printf 'VPN up\nVPN\n#00ff00\n' >"$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"
+   $ printf 'VPN up\nVPN\ncolor=#00ff00\n' >"$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"
    $ rm "$XDG_RUNTIME_DIR/i3sd-blocks/10-vpn"             # item disappears
 
-An empty file shows its name. Otherwise the i3blocks convention applies: the
-first line is ``full_text``, the second ``short_text`` and the third a color;
-an invalid color is ignored and an empty first line hides the item. Content is
-cut at ``max_bytes`` and text that is not UTF-8 falls back to the file name.
+An empty file shows its name. Otherwise the first line is ``full_text`` and
+the second is optional ``short_text``; an empty first line hides the item.
+The third line contains ``key=value`` options separated by spaces or tabs:
+
+.. code:: text
+
+   <b>VPN disconnected</b>
+   <b>VPN!</b>
+   color=#ff0000 pango=1 urgent=1
+
+Supported options are ``color=#RRGGBB`` or ``color=#RRGGBBAA``, ``pango`` and
+``urgent``. Both flags accept ``1``/``0`` or ``true``/``false``. Pango enables
+markup in both text variants. Options can appear in any order; unknown keys
+and invalid values are ignored individually, and the last valid value for a
+repeated option wins. Each update starts with no explicit color, no markup
+and no urgency. A bare color such as ``#00ff00`` is also accepted as shorthand
+for ``color=#00ff00``. Lines after the third are ignored.
+
+Content is cut at ``max_bytes`` and text that is not UTF-8 falls back to the
+file name.
 Names starting with ``.`` or ending in ``~`` are ignored, so producers can
 update atomically by writing ``.name.tmp`` and renaming it to ``name``.
 Symlinks, FIFOs, devices and subdirectories never render.
