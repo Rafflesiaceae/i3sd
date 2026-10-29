@@ -40,7 +40,7 @@ local outcomes = {}
 
 local function record(ctx, name)
     outcomes[#outcomes + 1] = name
-    if #outcomes == 2 then
+    if #outcomes == 3 then
         table.sort(outcomes)
         ctx:set { full_text = "limits:" .. table.concat(outcomes, ",") }
     end
@@ -68,6 +68,10 @@ block {
             return
         end
         limits_started = true
+        -- Timers created by a live callback are armed immediately.
+        ctx:after(0.05, function(timer_ctx)
+            record(timer_ctx, "after")
+        end)
         assert(ctx:spawn({
             argv = { "i3sd-test-missing-command" },
         }, function(result_ctx, result)

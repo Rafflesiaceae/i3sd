@@ -1241,6 +1241,18 @@ static int create_lua_timer(lua_State *lua, bool repeating) {
     timer->block = context->block;
     timer->delay_ns = delay_ns;
     timer->timer.interval_ns = repeating ? delay_ns : 0;
+    /* Staged timers start from the activation epoch in commit_generation;
+     * timers created by a live callback start counting now. */
+    if (!generation->staging) {
+        const uint64_t now_ns = monotonic_now_ns();
+        if (delay_ns > UINT64_MAX - now_ns ||
+            !i3sd_timer_add(&generation->app->timer_heap, &timer->timer,
+                            now_ns + delay_ns, timer->timer.interval_ns,
+                            timer)) {
+            free(timer);
+            return luaL_error(lua, "unable to schedule timer");
+        }
+    }
     lua_pushvalue(lua, 3);
     timer->callback_ref = luaL_ref(lua, LUA_REGISTRYINDEX);
     timer->next = generation->timers;

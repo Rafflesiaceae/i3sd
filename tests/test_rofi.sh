@@ -49,15 +49,15 @@ while ! grep -q '"full_text":"second"' "$test_dir/output" && \
 done
 grep -q '"full_text":"second"' "$test_dir/output"
 
-# The timed-out child and its grandchild are gone, and the missing
-# executable reported exit status 127.
+# The timed-out child and its grandchild are gone, the missing executable
+# reported exit status 127 and a timer created live fired.
 attempt=0
-while ! grep -q '"full_text":"limits:missing,timeout"' "$test_dir/output" && \
+while ! grep -q '"full_text":"limits:after,missing,timeout"' "$test_dir/output" && \
       test "$attempt" -lt 250; do
     attempt=$((attempt + 1))
     sleep 0.02
 done
-grep -q '"full_text":"limits:missing,timeout"' "$test_dir/output"
+grep -q '"full_text":"limits:after,missing,timeout"' "$test_dir/output"
 # SIGKILL is asynchronous, so give the grandchild a moment to disappear.
 # The exact command-line match ignores unrelated processes mentioning it.
 attempt=0
