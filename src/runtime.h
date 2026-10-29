@@ -7,6 +7,7 @@
 #include "i3sd/buffer.h"
 #include "i3sd/click.h"
 #include "i3sd/output.h"
+#include "i3sd/render_limiter.h"
 #include "i3sd/timer.h"
 
 #include <lua.h>
@@ -212,6 +213,7 @@ struct app {
     struct generation *current;
     struct i3sd_timer_heap timer_heap;
     struct i3sd_output output;
+    struct i3sd_render_limiter render_limiter;
     struct i3sd_click_framer click_framer;
     struct systemd_bus systemd_buses[2];
     struct power_profiles_source power_profiles;
@@ -229,7 +231,6 @@ struct app {
     unsigned int cli_setting_overrides;
     uint64_t next_registration_cookie;
     size_t prelude_offset;
-    uint64_t last_render_ns;
     char config_error[I3SD_CONFIG_ERROR_MAX + 1];
     bool stdout_registered;
     bool config_error_active;

@@ -51,7 +51,6 @@
 #define I3SD_EPOLL_EVENTS 64
 #define I3SD_TIMER_BUDGET 256U
 #define I3SD_OUTPUT_BUDGET (1024U * 1024U)
-#define I3SD_RENDER_INTERVAL_NS 50000000ULL
 #define I3SD_SPAWN_ARG_LIMIT 64U
 #define I3SD_SPAWN_ARG_BYTES 4096U
 #define I3SD_SPAWN_ARGV_BYTES (64U * 1024U)
@@ -1866,7 +1865,6 @@ static bool render_status(struct app *app) {
         return false;
     }
     app->render_dirty = false;
-    app->last_render_ns = monotonic_now_ns();
     return true;
 }
 
@@ -2152,9 +2150,11 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     if (timer != NULL) {
         deadline = timer->deadline_ns;
     }
-    if (app->render_dirty && app->last_render_ns != 0) {
+    /* Pending output resumes through EPOLLOUT, not a render deadline that may
+     * already be due. This also avoids spinning while stdout is blocked. */
+    if (app->render_dirty && !i3sd_output_has_pending(&app->output)) {
         const uint64_t render_deadline =
-            app->last_render_ns + I3SD_RENDER_INTERVAL_NS;
+            i3sd_render_limiter_deadline(&app->render_limiter);
         if (render_deadline < deadline) {
             deadline = render_deadline;
         }
@@ -2215,7 +2215,7 @@ static int epoll_timeout_ms(struct app *app, uint64_t now_ns) {
     if (power_supply_deadline < deadline) {
         deadline = power_supply_deadline;
     }
-    if (app->reload_dirty || (app->render_dirty && app->last_render_ns == 0)) {
+    if (app->reload_dirty) {
         return 0;
     }
     if (deadline == UINT64_MAX) {
@@ -2381,12 +2381,12 @@ static void run_event_loop(struct app *app) {
             }
         }
         if (app->render_dirty && !i3sd_output_has_pending(&app->output) &&
-            (app->last_render_ns == 0 ||
-             now_ns - app->last_render_ns >= I3SD_RENDER_INTERVAL_NS)) {
+            now_ns >= i3sd_render_limiter_deadline(&app->render_limiter)) {
             if (!render_status(app)) {
                 fprintf(stderr, "i3sd: fatal render failure\n");
                 break;
             }
+            i3sd_render_limiter_record(&app->render_limiter, now_ns);
         }
         const size_t prelude_length = strlen(
             app->settings.click_events ? protocol_prelude_with_clicks

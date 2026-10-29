@@ -1833,11 +1833,13 @@ Once any bytes of ``current`` have been written, it is immutable until completio
 ``render_dirty`` only; do not serialize an intermediate replacement. After completion, swap/promote it to ``last_completed`` and, if
 dirty, serialize the then-current canonical state exactly once.
 
-Rendering is deferred until the current event batch is complete so several state changes produce one serialization. The core also
-enforces a process-wide maximum render rate of 20 Hz by default. If visible state changes sooner than the minimum 50 ms interval, set
-``render_dirty`` and arm/reuse one monotonic one-shot deadline for the earliest permitted render; do not create a periodic tick.
-Finishing an already-partial frame is never rate-limited. The bound may be configurable within an implementation-defined safe range,
-but disabling storm protection is not the default.
+Rendering is deferred until the current event batch is complete so several state changes produce one serialization. A process-wide
+token bucket permits bursts of eight frames immediately and replenishes one render credit every 50 ms. Ordinary updates have no
+minimum frame interval; sustained changes exhaust the credits and are then limited to 20 Hz. While throttled, retain ``render_dirty``
+and include the earliest permitted render in the reactor's next deadline; do not create a periodic tick. Credits refill implicitly
+with elapsed monotonic time, up to the eight-frame capacity, without idle wakeups. Charge one credit per successfully constructed
+frame, rather than per incoming event. Finishing an already-partial frame is never rate-limited, and pending stdout output waits for
+writability without scheduling a render wakeup.
 
 Startup and Diagnostics
 -----------------------
@@ -2302,8 +2304,8 @@ should exhibit these properties:
 - file-age warnings use a change watch plus an exact one-shot stale deadline rather than periodic age polling;
 - optional health probes do not wake sleeping storage by default;
 - package-maintenance built-ins consume only local package-database state, and no IP/network status collector exists;
-- several state changes within one batch cause at most one render attempt, and continuous change is capped by a one-shot-driven
-  default 20 Hz render-rate ceiling rather than an unbounded render storm;
+- several state changes within one batch cause at most one render attempt; an eight-frame token bucket allows immediate bursts
+  before limiting sustained changes to 20 Hz, without periodic wakeups;
 - unchanged block state causes no render request;
 - blocked partial stdout causes at most one later serialization of the newest state;
 - byte-identical output causes no stdout write;

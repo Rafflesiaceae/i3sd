@@ -52,6 +52,7 @@ core_sources = files(
     'src/buffer.c',
     'src/click.c',
     'src/output.c',
+    'src/render_limiter.c',
     'src/timer.c',
     'src/utf8.c',
 )
